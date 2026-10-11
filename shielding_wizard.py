@@ -29,8 +29,6 @@ Units contract.
     Areas            : m2
     Workloads        : Gy/week
     Design goal P    : Sv/week
-    Dose rates Ddot0 : Gy/h
-    IDR values       : Sv/h
     Field area F     : cm2  - NCRP normalisation. Do NOT convert to m2.
                         It has been done before. It did not end well.
 
@@ -40,7 +38,7 @@ Unless you are building something that warrants its own exclusion zone.
 If that is the case, I sincerely hope you are not using a wizard GUI for the shielding calculations.
 If you are, have you tried therapy, a confession to your local priest, or Monte Carlo? I've heard they work better.
 
-No external dependencies. Python stdlib only: math, tkinter.
+No external dependencies. Python stdlib only: math, re, tkinter, datetime.
 If something breaks, the problem is in this file. At least it is easy to find.
 
 Author: A severely underslept, overworked and severely caffeinated medical and radiation physicist. AKA notcosmonaut
@@ -50,20 +48,22 @@ Author: A severely underslept, overworked and severely caffeinated medical and r
 
 from __future__ import annotations
 import math
+import re
 import tkinter as tk
-from tkinter import ttk, messagebox
+from datetime import datetime
+from tkinter import ttk, messagebox, filedialog
 from typing import Optional
 
 
 # ==============================================================================
-# TVL TABLE - Tenth Value Layers for primary barrier (concrete, cm)
-# Source: NCRP Report No. 151, Table B.2
+# TVL TABLE - Tenth Value Layers for leakage radiation (concrete, cm)
+# Source: NCRP Report No. 151, Table B.7
 # ------------------------------------------------------------------------------
 # TVL1  : first TVL - accounts for beam hardening in the initial layer
 # TVLe  : equilibrium TVL - for all subsequent layers after the beam hardens
 # Energy in MV. Co-60 is a special case (1.25 MeV photons), handled separately.
 # Units: cm of ordinary concrete.
-# Used by the D-branch barrier thickness calculation.
+# Used for B_LT, leakage through the concrete inner maze wall (M-branch).
 # The table carries more energies than the SETUP dropdown offers. That is
 # deliberate: the dropdown is limited by the albedo tables, not by this one.
 # ==============================================================================
@@ -458,38 +458,6 @@ def lookup_albedo_soft(table: dict, scatter_angle: float) -> float:
 
 
 # ==============================================================================
-# IPEM IDR COMPLIANCE CHECK
-# ------------------------------------------------------------------------------
-# Two IPEM limits at the door, both in Sv/h:
-#   IDR_total <= 7.5e-6   (instantaneous, through the shielding)
-#   R8h       <= 0.5e-6   (time-averaged over an 8 h day, 40 h week)
-# Rw = unshielded total dose rate x weekly beam-on hours x U, with U = 1 at a
-# secondary barrier. R8h = Rw / 40 -- confirmed against three independent
-# reference values, so resist the urge to rederive it.
-# ==============================================================================
-
-_IPEM_IDR_LIMIT = 7.5e-6   # Sv/h
-_IPEM_R8H_LIMIT = 0.5e-6   # Sv/h
-
-
-def ipem_idr_checks(idr_total: float, dr_total_unshielded: float,
-                    weekly_beam_on_hours: float) -> dict:
-    """Both IPEM door checks. Returns values, pass flags, and margins."""
-    U = 1.0  # secondary barrier, not a choice
-    Rw = dr_total_unshielded * weekly_beam_on_hours * U
-    R8h = Rw / 40.0
-    return {
-        "IDR_check_value":  idr_total,
-        "IDR_check_pass":   idr_total <= _IPEM_IDR_LIMIT,
-        "IDR_check_margin": _IPEM_IDR_LIMIT - idr_total,
-        "Rw":               Rw,
-        "R8h":              R8h,
-        "R8h_check_pass":   R8h <= _IPEM_R8H_LIMIT,
-        "R8h_check_margin": _IPEM_R8H_LIMIT - R8h,
-    }
-
-
-# ==============================================================================
 # GUI HELPER CLASSES
 # Reused across steps. Everything else stays inline per step.
 # ==============================================================================
@@ -526,6 +494,26 @@ class _Tooltip:
             self._tw = None
 
 
+_POWER_OF_TEN = re.compile(r"(?:([+-]?(?:\d+\.?\d*|\.\d+))[xX*×·])?10(?:\^|\*\*)([+-]?\d+)")
+
+
+def _parse_power_of_ten(text: str) -> float:
+    """
+    Read a number the way people write big ones: 4.5e15, 4.5E+15, 4.5x10^15,
+    4.5*10^15, 4.5×10^15, 10^15. A decimal comma (4,5e15) is accepted too.
+    Raises ValueError for anything else.
+    """
+    t = text.strip().replace(" ", "").replace("−", "-").replace(",", ".")
+    try:
+        return float(t)
+    except ValueError:
+        pass
+    m = _POWER_OF_TEN.fullmatch(t)
+    if m is None:
+        raise ValueError(f"not a number: {text!r}")
+    return float(m.group(1) or 1.0) * 10.0 ** int(m.group(2))
+
+
 class _ValidatedEntry(ttk.Entry):
     """
     Float entry with bounds validation on focus-out.
@@ -536,12 +524,16 @@ class _ValidatedEntry(ttk.Entry):
 
     def __init__(self, parent, minv: Optional[float] = None,
                  maxv: Optional[float] = None, label: str = "Value",
-                 reason_widget: Optional[ttk.Label] = None, **kw) -> None:
+                 reason_widget: Optional[ttk.Label] = None,
+                 example: Optional[str] = None, **kw) -> None:
         super().__init__(parent, **kw)
         self._minv = minv
         self._maxv = maxv
         self._label = label
         self._reason = reason_widget
+        # Fields given an example accept powers of ten written by hand
+        # (4.5x10^15) and say how in their error text. Others stay plain float.
+        self._example = example
         # Optimistic until proven otherwise. An untouched default is not "wrong",
         # it is merely "not yet right".
         self.is_valid = True
@@ -550,12 +542,21 @@ class _ValidatedEntry(ttk.Entry):
     def _expected_text(self) -> str:
         """Describe the acceptable range in words a tired person can understand."""
         if self._minv is not None and self._maxv is not None:
-            return f"{self._label} must be a number between {self._minv} and {self._maxv}."
-        if self._minv is not None:
-            return f"{self._label} must be a number >= {self._minv}."
-        if self._maxv is not None:
-            return f"{self._label} must be a number <= {self._maxv}."
-        return f"{self._label} must be a number."
+            text = f"{self._label} must be a number between {self._minv} and {self._maxv}."
+        elif self._minv is not None:
+            text = f"{self._label} must be a number >= {self._minv}."
+        elif self._maxv is not None:
+            text = f"{self._label} must be a number <= {self._maxv}."
+        else:
+            text = f"{self._label} must be a number."
+        if self._example:
+            text += f" Write it as {self._example}."
+        return text
+
+    def value(self) -> float:
+        """Parsed contents. Raises ValueError, same as float()."""
+        text = self.get()
+        return _parse_power_of_ten(text) if self._example else float(text.strip())
 
     def _check(self, _evt: tk.Event = None) -> bool:
         """
@@ -563,8 +564,12 @@ class _ValidatedEntry(ttk.Entry):
         The step may call this directly during its sweep, or rely on focus-out.
         """
         try:
-            val = float(self.get().strip())
+            val = self.value()
         except ValueError:
+            self._mark_invalid()
+            return False
+        # float() happily takes "nan" and "inf", and nan slips past every bound.
+        if not math.isfinite(val):
             self._mark_invalid()
             return False
 
@@ -591,6 +596,96 @@ class _ValidatedEntry(ttk.Entry):
             self._reason.config(text=self._expected_text())  # explain yourself
 
 
+def _add_export_buttons(btn_frame: ttk.Frame, text_area: tk.Text) -> None:
+    """Copy and Save buttons for a results screen. Exports exactly what is shown."""
+
+    def report() -> str:
+        header = f"RT Bunker Shielding Wizard - {datetime.now():%Y-%m-%d %H:%M}\n\n"
+        return header + text_area.get("1.0", "end-1c")
+
+    def copy() -> None:
+        text_area.clipboard_clear()
+        text_area.clipboard_append(report())
+        # Feedback without a popup: the button says it worked, then forgets.
+        copy_btn.config(text="Copied")
+        copy_btn.after(1500, lambda: copy_btn.config(text="Copy"))
+
+    def save() -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("All files", "*.*")],
+            initialfile=f"shielding_results_{datetime.now():%Y%m%d_%H%M}.txt",
+        )
+        if not path:
+            return   # user closed the dialog
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(report())
+        except OSError as e:
+            messagebox.showerror("Save failed", f"Could not write the file:\n{e}")
+
+    copy_btn = ttk.Button(btn_frame, text="Copy", command=copy)
+    copy_btn.pack(side="left", padx=5)
+    ttk.Button(btn_frame, text="Save...", command=save).pack(side="left", padx=5)
+
+
+# ------------------------------------------------------------------------------
+# Input memory. Steps are destroyed on Back so they rebuild against fresh
+# upstream data, which used to throw the user's typing away with them.
+# Before a step dies its widget values are snapshotted, keyed by widget path
+# relative to the step frame. Tkinter names children per parent in creation
+# order, so a rebuilt step gets the same relative paths and the values land
+# back where they came from. Radio/check buttons are restored with invoke()
+# so their show/hide callbacks run, before the entries they reveal are filled.
+# ------------------------------------------------------------------------------
+
+def _snapshot_inputs(frame: tk.Widget) -> dict:
+    base = str(frame)
+    saved: dict = {}
+
+    def walk(w: tk.Widget) -> None:
+        for c in w.winfo_children():
+            key = str(c)[len(base):]
+            # Combobox subclasses Entry, so it must be tested first.
+            if isinstance(c, ttk.Combobox):
+                saved[key] = ("value", c.get())
+            elif isinstance(c, ttk.Entry):
+                saved[key] = ("value", c.get())
+            elif isinstance(c, (ttk.Radiobutton, ttk.Checkbutton)):
+                saved[key] = ("selected", c.instate(["selected"]))
+            walk(c)
+
+    walk(frame)
+    return saved
+
+
+def _restore_inputs(frame: tk.Widget, saved: dict) -> None:
+    base = str(frame)
+    buttons, fields = [], []
+
+    def walk(w: tk.Widget) -> None:
+        for c in w.winfo_children():
+            entry = saved.get(str(c)[len(base):])
+            if entry is not None:
+                (buttons if entry[0] == "selected" else fields).append((c, entry[1]))
+            walk(c)
+
+    walk(frame)
+    for btn, was_selected in buttons:
+        # Radio: invoke the one that was chosen. Check: invoke only to flip it.
+        if isinstance(btn, ttk.Radiobutton):
+            if was_selected:
+                btn.invoke()
+        elif btn.instate(["selected"]) != was_selected:
+            btn.invoke()
+    for field, value in fields:
+        if isinstance(field, ttk.Combobox):
+            field.set(value)
+        else:
+            field.delete(0, "end")
+            field.insert(0, value)
+
+
 INTRO_TEXT = (
     "Radiation Shielding Calculation Wizard\n\n"
     "Step-by-step shielding calculations for radiotherapy bunkers and diagnostic "
@@ -607,6 +702,16 @@ INTRO_TEXT = (
 # ==============================================================================
 # WIZARD STEP BASE CLASS
 # ==============================================================================
+
+class WrapLabel(ttk.Label):
+    """Label whose wraplength follows its own width. Pack with fill="x"."""
+
+    def __init__(self, master, **kw) -> None:
+        kw.setdefault("justify", "left")
+        super().__init__(master, **kw)
+        self.bind("<Configure>",
+                  lambda e: self.configure(wraplength=max(e.width - 4, 1)))
+
 
 class WizardStep:
     """Base class for all wizard steps."""
@@ -699,8 +804,9 @@ RT_CHECKLIST_TEXT = (
     "you through workload estimation, IMRT and TBI corrections, maze geometry, "
     "and door shielding in that order.\n\n"
     "Have the following ready:\n\n"
-    "  -  Beam energies, dose rate at isocentre Ddot0 [Gy/h], and workload "
-    "estimates. If you do not have Ddot0, call the vendor.\n"
+    # [IDR] "  -  Beam energies, dose rate at isocentre Ddot0 [Gy/h], and workload "
+    # [IDR] "estimates. If you do not have Ddot0, call the vendor.\n"
+    "  -  Beam energies and workload estimates.\n"
     "  -  Bunker floor plan with dimensions. You will need several distances.\n"
     "  -  Design goal P [Sv/week] and occupancy factors. Typical values are "
     "pre-filled but you are expected to verify them for your specific situation.\n"
@@ -734,15 +840,19 @@ class Step_RT_Checklist(WizardStep):
         scrollbar.pack(side="right", fill="y")
 
         self._ack = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            self.frame,
+        ack_row = ttk.Frame(self.frame)
+        ack_row.pack(fill="x", padx=20, pady=(5, 15))
+        ttk.Checkbutton(ack_row, variable=self._ack).pack(side="left", anchor="n")
+        ack_label = WrapLabel(
+            ack_row,
             text=(
                 "I understand that this tool is a verification aid only. "
                 "All calculations and their consequences remain the sole "
                 "responsibility of the qualified person signing off the work."
             ),
-            variable=self._ack,
-        ).pack(anchor="w", padx=20, pady=(5, 15))
+        )
+        ack_label.pack(side="left", fill="x", expand=True)
+        ack_label.bind("<Button-1>", lambda e: self._ack.set(not self._ack.get()))
 
         btn_frame = ttk.Frame(self.frame)
         btn_frame.pack(pady=(0, 20))
@@ -792,10 +902,11 @@ class Step_SETUP_Workload(WizardStep):
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Workload Parameters",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         ttk.Label(
             self.frame,
@@ -875,10 +986,8 @@ class Step_SETUP_Workload(WizardStep):
             tooltip="Treatment days per week [1-7].")
         row("Gy/therapy:",     f"Grays_{suffix}",             minv=0.0, default=2.0,
             tooltip="Absorbed dose per treatment session [Gy].")
-        row("Ddot0 [Gy/h]:",   f"Ddot0_{suffix}",             minv=0.0,
-            tooltip="Instantaneous dose rate at isocentre [Gy/h]. From vendor specs.")
-        row("Beam-on [min/tx]:", f"beam_on_{suffix}",         minv=0.0, default=2.0,
-            tooltip="Average beam-on time per treatment [minutes]. Feeds the IPEM time-averaged dose rate check.")
+        # [IDR] row("Ddot0 [Gy/h]:",   f"Ddot0_{suffix}",             minv=0.0,
+            # [IDR] tooltip="Instantaneous dose rate at isocentre [Gy/h]. From vendor specs.")
 
     def _toggle_single(self) -> None:
         # Hidden fields keep their defaults; get_data zeroes the slot anyway.
@@ -923,11 +1032,6 @@ class Step_SETUP_Workload(WizardStep):
             data["days_per_week_max"]
         )
 
-        # IPEM time-averaged check needs the weekly beam-on hours.
-        data["weekly_beam_on_hours"] = (
-            data["beam_on_min"] * data["therapies_per_day_min"] * data["days_per_week_min"]
-            + data["beam_on_max"] * data["therapies_per_day_max"] * data["days_per_week_max"]
-        ) / 60.0
         return data
 
 
@@ -935,8 +1039,8 @@ class Step_SETUP_Workload(WizardStep):
 # SETUP STEP 2 : IMRT CORRECTION
 # ------------------------------------------------------------------------------
 # If IMRT is not used, all IMRT values are zeroed and W remains unchanged.
-# If IMRT is used, MU ratios and fractions are collected here and C_I,
-# F_imrt, W_conv, W_IMRT are calculated inline on advancement.
+# If IMRT is used, C_I (MU_IMRT/MU_conv) and the IMRT fraction are collected
+# here and F_imrt, W_conv, W_IMRT are calculated inline on advancement.
 # ==============================================================================
 
 class Step_SETUP_IMRT(WizardStep):
@@ -946,10 +1050,11 @@ class Step_SETUP_IMRT(WizardStep):
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="IMRT Correction",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         self._imrt_used = tk.BooleanVar(value=False)
 
@@ -1013,10 +1118,11 @@ class Step_SETUP_IMRT(WizardStep):
 
         row("IMRT fraction p:",  f"p_imrt_{suffix}",   minv=0.0, maxv=1.0,
             tooltip="Fraction of treatments delivered as IMRT [0-1].")
-        row("MU_IMRT:",          f"MU_IMRT_{suffix}",  minv=0.0,
-            tooltip="Monitor units per IMRT treatment.")
-        row("MU_conv:",  f"MU_conv_{suffix}",  minv=0.001,
-            tooltip="Monitor units per conventional treatment. Must be > 0.")
+        row("C_I (MU ratio):", f"C_I_{suffix}", minv=0.0, default="",
+            tooltip="IMRT MU inflation: monitor units per IMRT treatment divided by "
+                    "monitor units per conventional treatment. Enter the ratio, e.g. 3. "
+                    "This is the average MU used by your IMRT technique compared to the MU used in conventional techniques. "
+                    "Note: entering 0 or 1 is treated as no IMRT at this energy.")
 
     def _toggle(self) -> None:
         # Show or hide the IMRT input frame based on radio selection.
@@ -1032,53 +1138,29 @@ class Step_SETUP_IMRT(WizardStep):
         return all(entry._check() for entry in self._entries.values())
 
     def get_data(self) -> dict:
-        if not self._imrt_used.get():
-            # IMRT not used -- zero everything, W unchanged.
-            return {
-                "imrt_used":    False,
-                "p_imrt_min":   0.0, "p_imrt_max":   0.0,
-                "MU_IMRT_min":  0.0, "MU_IMRT_max":  0.0,
-                "MU_conv_min":  0.0, "MU_conv_max":  0.0,
-                # C_I is a MU ratio. No IMRT means no MU inflation, ratio of 1.
-                # Numerically inert here (multiplied by zero workload) but a
-                # ratio of nought would be a lie.
-                "C_I_min":      1.0, "C_I_max":      1.0,
-                "F_imrt_min":   1.0, "F_imrt_max":   1.0,
-                "W_conv_min":   self.wizard.data["W_base_min"],
-                "W_conv_max":   self.wizard.data["W_base_max"],
-                "W_IMRT_min":   0.0, "W_IMRT_max":   0.0,
+        W_base = {k: self.wizard.data[f"W_base_{k}"] for k in ("min", "max")}
+        used = self._imrt_used.get()
+        out = {}
+        for k in ("min", "max"):
+            C_I = float(self._entries[f"C_I_{k}"].get()) if used else 0.0
+            # C_I = 0 or 1 is the same switch as "IMRT not used" for this energy:
+            # everything zeroed, W unchanged. C_I is a MU ratio, so the inert
+            # value is 1 (no MU inflation), not 0.
+            if C_I in (0.0, 1.0):
+                p, C_I, F = 0.0, 1.0, 1.0
+            else:
+                p = float(self._entries[f"p_imrt_{k}"].get())
+                # F_imrt: effective workload multiplier accounting for IMRT fraction.
+                F = p * C_I + (1.0 - p)
+            out |= {
+                f"p_imrt_{k}":  p,
+                f"C_I_{k}":     C_I,
+                f"F_imrt_{k}":  F,
+                f"W_conv_{k}":  (1.0 - p) * W_base[k],
+                f"W_IMRT_{k}":  p * W_base[k],
             }
-
-        p_min  = float(self._entries["p_imrt_min"].get())
-        p_max  = float(self._entries["p_imrt_max"].get())
-        mu_i_min = float(self._entries["MU_IMRT_min"].get())
-        mu_i_max = float(self._entries["MU_IMRT_max"].get())
-        mu_c_min = float(self._entries["MU_conv_min"].get())
-        mu_c_max = float(self._entries["MU_conv_max"].get())
-
-        # C_I: IMRT MU ratio. Guards against zero conventional MU.
-        C_I_min = mu_i_min / mu_c_min if mu_c_min > 0.0 else 0.0
-        C_I_max = mu_i_max / mu_c_max if mu_c_max > 0.0 else 0.0
-
-        # F_imrt: effective workload multiplier accounting for IMRT fraction.
-        F_imrt_min = p_min * C_I_min + (1.0 - p_min)
-        F_imrt_max = p_max * C_I_max + (1.0 - p_max)
-
-        W_base_min = self.wizard.data["W_base_min"]
-        W_base_max = self.wizard.data["W_base_max"]
-
-        return {
-            "imrt_used":   True,
-            "p_imrt_min":  p_min,   "p_imrt_max":  p_max,
-            "MU_IMRT_min": mu_i_min, "MU_IMRT_max": mu_i_max,
-            "MU_conv_min": mu_c_min, "MU_conv_max": mu_c_max,
-            "C_I_min":     C_I_min,  "C_I_max":     C_I_max,
-            "F_imrt_min":  F_imrt_min, "F_imrt_max": F_imrt_max,
-            "W_conv_min":  (1.0 - p_min) * W_base_min,
-            "W_conv_max":  (1.0 - p_max) * W_base_max,
-            "W_IMRT_min":  p_min * W_base_min,
-            "W_IMRT_max":  p_max * W_base_max,
-        }
+        out["imrt_used"] = out["p_imrt_min"] > 0.0 or out["p_imrt_max"] > 0.0
+        return out
 
 
 # ==============================================================================
@@ -1097,10 +1179,11 @@ class Step_SETUP_TBI(WizardStep):
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="TBI Correction",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         self._tbi_used = tk.BooleanVar(value=False)
 
@@ -1212,10 +1295,11 @@ class Step_SETUP_Maze(WizardStep):
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Bunker Configuration",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         self._maze_exists = tk.BooleanVar(value=True)
 
@@ -1276,19 +1360,20 @@ class Step_M_Primary(WizardStep):
         # How many times the user has insisted 'Yes'. Patience is finite.
         self._yes_count = 0
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Primary Beam at Maze Entrance",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         self._primary_reaches = tk.BooleanVar(value=False)
 
         radio_frame = ttk.Frame(self.frame)
-        radio_frame.pack(anchor="w", padx=20, pady=10)
-        ttk.Label(
+        radio_frame.pack(fill="x", padx=20, pady=10)
+        WrapLabel(
             radio_frame,
             text="Does the primary beam reach the maze entrance?",
-        ).pack(side="left", padx=(0, 15))
+        ).pack(side="left", padx=(0, 15), fill="x", expand=True)
         ttk.Radiobutton(
             radio_frame, text="Yes", variable=self._primary_reaches,
             value=True,
@@ -1299,11 +1384,11 @@ class Step_M_Primary(WizardStep):
         ).pack(side="left", padx=5)
 
         # Inline reason label, sits under the radios. Grows ruder on repetition.
-        self._reason = ttk.Label(
+        self._reason = WrapLabel(
             self.frame, text="", foreground="red",
-            font=("Segoe UI", 10), wraplength=500, justify="left",
+            font=("Segoe UI", 10),
         )
-        self._reason.pack(anchor="w", padx=20, pady=(0, 10))
+        self._reason.pack(fill="x", padx=20, pady=(0, 10))
 
         btn_frame = ttk.Frame(self.frame)
         btn_frame.pack(pady=15)
@@ -1374,10 +1459,11 @@ class Step_M_Geometry(WizardStep):
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Maze Geometry and Photon Parameters",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         # Scrollable container. The field count does not fit on one screen.
         canvas = tk.Canvas(self.frame, highlightthickness=0)
@@ -1694,10 +1780,11 @@ class Step_M_Calculations(WizardStep):
         # Populated by show(), returned by get_data() so rollback can undo it.
         self._results: dict = {}
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Photon Dose at the Door",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 10))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 10), fill="x")
 
         text_frame = ttk.Frame(self.frame)
         text_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -1736,9 +1823,14 @@ class Step_M_Calculations(WizardStep):
             t_wall, i_theta, s_theta = d["t"], d["i_theta"], d["s_theta"]
 
             # Slant path through the inner maze wall for leakage transmission.
+            # The wall is concrete, so use the concrete leakage TVLs (TVL1 for
+            # the first tenth, TVLe after), not the 0.6 cm lead TVL.
             t_s_cm = (t_wall / math.cos(math.radians(i_theta))) * 100.0
-            tvl_ph = 0.6
-            B_LT = 10.0 ** (-(t_s_cm / tvl_ph))
+            tvl1_lt, tvle_lt = lookup_tvl(E_max)
+            if t_s_cm <= tvl1_lt:
+                B_LT = 10.0 ** (-t_s_cm / tvl1_lt)
+            else:
+                B_LT = 10.0 ** (-(1.0 + (t_s_cm - tvl1_lt) / tvle_lt))
 
             # Patient scatter fraction. Potato's real formula, verified: uses
             # its bilinear interpolation on Table B.4 with the axes swapped,
@@ -1770,8 +1862,8 @@ class Step_M_Calculations(WizardStep):
 
             # Eq 3.7: patient scatter off the maze wall. Potato's real weekly
             # formula (functions.py, weekly_dose_patient_scatter) has NO F/400
-            # term - that normalisation only appears in potato's separate
-            # instantaneous DR_ps calc (Step_M_Bph), not here. Confirmed:
+            # term - that normalisation only appeared in potato's separate
+            # dose-rate calc, never here. Confirmed:
             # including it here overstated H_PS by exactly 4x (F/400=4)
             # against the verified reference.
             H_PS = (
@@ -1845,26 +1937,26 @@ class Step_M_Calculations(WizardStep):
 
 
 # ==============================================================================
-# M STEP 4 : REQUIRED LEAD THICKNESS AND INSTANTANEOUS DOSE RATE
+# M STEP 4 : REQUIRED LEAD THICKNESS
 # ------------------------------------------------------------------------------
 # B_ph already computed in Step_M_Calculations. This step converts it to a
-# lead thickness, then re-derives the dose RATE (not weekly dose) through
-# that same thickness as a cross-check using Ddot0 instead of workload.
+# lead thickness.
 # TVL for photon scatter/leakage in lead is 0.6 cm throughout.
 # ==============================================================================
 
 class Step_M_Bph(WizardStep):
-    """Lead thickness from B_ph, then instantaneous dose rate through it."""
+    """Lead thickness from B_ph."""
 
     def __init__(self, parent: tk.Frame, wizard: 'ShieldingWizard') -> None:
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
         self._results: dict = {}
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Required Lead Thickness",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 10))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 10), fill="x")
 
         text_frame = ttk.Frame(self.frame)
         text_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -1900,63 +1992,64 @@ class Step_M_Bph(WizardStep):
             else:
                 x_ph_lead = 0.0
 
-            # Instantaneous dose rate through x_ph_lead, using Ddot0 rather
-            # than weekly workload.
-            d_h, d_r, d_z = d["d_h"], d["d_r"], d["d_z"]
-            d_sca, d_sec, d_zz, d_L = d["d_sca"], d["d_sec"], d["d_zz"], d["d_L"]
+            # [IDR] # Instantaneous dose rate through x_ph_lead, using Ddot0 rather
+            # [IDR] # than weekly workload.
+            # [IDR] d_h, d_r, d_z = d["d_h"], d["d_r"], d["d_z"]
+            # [IDR] d_sca, d_sec, d_zz, d_L = d["d_sca"], d["d_sec"], d["d_zz"], d["d_L"]
 
-            if min(d_h, d_r, d_z, d_sca, d_sec, d_zz, d_L) <= 0.0:
-                raise ValueError("All distance parameters must be > 0.")
+            # [IDR] if min(d_h, d_r, d_z, d_sca, d_sec, d_zz, d_L) <= 0.0:
+                # [IDR] raise ValueError("All distance parameters must be > 0.")
 
-            # Structurally mirrors H_s: pure double-reflection geometry with
-            # Ddot0 in place of W. The old B_pr transmission term was a
-            # site-specific artefact, not NCRP - removed.
-            # No independently verified numeric target exists for this form yet.
-            DRs = (
-                (d["Ddot0_max"] * d["alpha0_max"] + d["Ddot0_min"] * d["alpha0_min"])
-                * d["U_G"] * d["A0"] * d["alpha_z"] * d["Az"]
-            ) / ((d_h * d_r * d_z) ** 2)
+            # [IDR] # Structurally mirrors H_s: pure double-reflection geometry with
+            # [IDR] # Ddot0 in place of W. The old B_pr transmission term was a
+            # [IDR] # site-specific artefact, not NCRP - removed.
+            # [IDR] # No independently verified numeric target exists for this form yet.
+            # [IDR] DRs = (
+                # [IDR] (d["Ddot0_max"] * d["alpha0_max"] + d["Ddot0_min"] * d["alpha0_min"])
+                # [IDR] * d["U_G"] * d["A0"] * d["alpha_z"] * d["Az"]
+            # [IDR] ) / ((d_h * d_r * d_z) ** 2)
 
-            # Matches the reverted H_PS: energy-split alpha1, not the soft
-            # spectrum substitution. Potato's real formula, verified.
-            DR_ps = (
-                (d["Ddot0_max"] * d["alpha1_max"] + d["Ddot0_min"] * d["alpha1_min"])
-                * d["alpha_theta"] * d["A1"] * (d["F"] / 400.0)
-            ) / ((d_sca * d_sec * d_zz) ** 2)
+            # [IDR] # Matches the reverted H_PS: energy-split alpha1, not the soft
+            # [IDR] # spectrum substitution. Potato's real formula, verified.
+            # [IDR] DR_ps = (
+                # [IDR] (d["Ddot0_max"] * d["alpha1_max"] + d["Ddot0_min"] * d["alpha1_min"])
+                # [IDR] * d["alpha_theta"] * d["A1"] * (d["F"] / 400.0)
+            # [IDR] ) / ((d_sca * d_sec * d_zz) ** 2)
 
-            DR_ls = (
-                (d["Ddot0_max"] * d["alpha1_max"] + d["Ddot0_min"] * d["alpha1_min"])
-                * d["L_f"] * d["A1"]
-            ) / ((d_sec * d_zz) ** 2)
+            # [IDR] DR_ls = (
+                # [IDR] (d["Ddot0_max"] * d["alpha1_max"] + d["Ddot0_min"] * d["alpha1_min"])
+                # [IDR] * d["L_f"] * d["A1"]
+            # [IDR] ) / ((d_sec * d_zz) ** 2)
 
-            DR_lt = (
-                (d["Ddot0_max"] + d["Ddot0_min"]) * d["B_LT"] * d["L_f"]
-            ) / (d_L ** 2)
+            # [IDR] DR_lt = (
+                # [IDR] (d["Ddot0_max"] + d["Ddot0_min"]) * d["B_LT"] * d["L_f"]
+            # [IDR] ) / (d_L ** 2)
 
-            DR_ph = DR_ps + d["f"] * DRs + DR_ls + DR_lt
-            IDR_ph = DR_ph * (10.0 ** (-x_ph_lead / tvl_ph))
+            # [IDR] DR_ph = DR_ps + d["f"] * DRs + DR_ls + DR_lt
+            # [IDR] IDR_ph = DR_ph * (10.0 ** (-x_ph_lead / tvl_ph))
 
             self._results = {
                 "x_ph_lead": x_ph_lead,
-                "DRs": DRs, "DR_ps": DR_ps, "DR_ls": DR_ls, "DR_lt": DR_lt,
-                "DR_ph": DR_ph, "IDR_ph": IDR_ph,
+                # [IDR] "DRs": DRs, "DR_ps": DR_ps, "DR_ls": DR_ls, "DR_lt": DR_lt,
+                # [IDR] "DR_ph": DR_ph, "IDR_ph": IDR_ph,
             }
 
             report = [
                 "=" * 65,
-                "REQUIRED LEAD THICKNESS AND DOSE RATE CHECK",
+                # [IDR] "REQUIRED LEAD THICKNESS AND DOSE RATE CHECK",
+                "REQUIRED LEAD THICKNESS",
                 "=" * 65,
                 f"B_ph (required transmission)   : {B_ph:.3e}",
                 f"Lead thickness x_ph_lead       : {x_ph_lead:.2f} cm",
-                "-" * 65,
-                "Instantaneous dose rate through x_ph_lead:",
-                f"  Wall scatter          DRs   : {DRs:.3e} Sv/h",
-                f"  Patient scatter        DR_ps : {DR_ps:.3e} Sv/h",
-                f"  Head leakage scatter   DR_ls : {DR_ls:.3e} Sv/h",
-                f"  Leakage transmission   DR_lt : {DR_lt:.3e} Sv/h",
-                "-" * 65,
-                f"Total dose rate         DR_ph : {DR_ph:.3e} Sv/h",
-                f"Instantaneous dose rate IDR_ph: {IDR_ph:.3e} Sv/h",
+                # [IDR] "-" * 65,
+                # [IDR] "Instantaneous dose rate through x_ph_lead:",
+                # [IDR] f"  Wall scatter          DRs   : {DRs:.3e} Sv/h",
+                # [IDR] f"  Patient scatter        DR_ps : {DR_ps:.3e} Sv/h",
+                # [IDR] f"  Head leakage scatter   DR_ls : {DR_ls:.3e} Sv/h",
+                # [IDR] f"  Leakage transmission   DR_lt : {DR_lt:.3e} Sv/h",
+                # [IDR] "-" * 65,
+                # [IDR] f"Total dose rate         DR_ph : {DR_ph:.3e} Sv/h",
+                # [IDR] f"Instantaneous dose rate IDR_ph: {IDR_ph:.3e} Sv/h",
                 "=" * 65,
             ]
             self.text_area.delete("1.0", "end")
@@ -1993,10 +2086,11 @@ class Step_M_Results(WizardStep):
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Required Door Shielding: Photons",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 10))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 10), fill="x")
 
         text_frame = ttk.Frame(self.frame)
         text_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -2012,6 +2106,7 @@ class Step_M_Results(WizardStep):
         btn_frame.pack(pady=15)
         ttk.Button(btn_frame, text="Restart", command=self.wizard.restart_workflow).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Back", command=self.wizard.prev_step).pack(side="left", padx=5)
+        _add_export_buttons(btn_frame, self.text_area)
 
     def show(self) -> None:
         super().show()
@@ -2021,7 +2116,7 @@ class Step_M_Results(WizardStep):
         d = self.wizard.data
         try:
             x_pb = d["x_ph_lead"]
-            idr = d["IDR_ph"]
+            # [IDR] idr = d["IDR_ph"]
             margin = self._HVL_FRACTION * self._TVL_PB
             x_total = x_pb + margin
 
@@ -2035,35 +2130,11 @@ class Step_M_Results(WizardStep):
                 f"Calculated lead thickness      : {x_pb:.2f} cm Pb",
                 f"Plus 1 HVL safety margin       : {margin:.2f} cm Pb",
                 f"Recommended total              : {x_total:.2f} cm Pb",
-                "-" * 65,
-                f"Instantaneous dose rate IDR_ph : {idr:.3e} Sv/h",
-                f"                               = {idr * 1e6:.2f} uSv/h",
+                # [IDR] "-" * 65,
+                # [IDR] f"Instantaneous dose rate IDR_ph : {idr:.3e} Sv/h",
+                # [IDR] f"                               = {idr * 1e6:.2f} uSv/h",
             ]
 
-            # IPEM checks. Photons are the whole story below 10 MV.
-            chk = ipem_idr_checks(idr, d["DR_ph"], d["weekly_beam_on_hours"])
-            report += [
-                "-" * 65,
-                "IPEM IDR COMPLIANCE",
-                f"  IDR total (shielded)      : {idr*1e6:.3f} uSv/h "
-                f"(limit 7.5) -- {'PASS' if chk['IDR_check_pass'] else 'FAIL'}",
-                f"    Margin                  : {chk['IDR_check_margin']*1e6:+.3f} uSv/h",
-                f"  Weekly beam-on time       : {d['weekly_beam_on_hours']:.2f} h",
-                f"  Rw (weekly, unshielded)   : {chk['Rw']*1e6:.3f} uSv",
-                f"  R8h (daily-averaged)      : {chk['R8h']*1e6:.3f} uSv/h "
-                f"(limit 0.5) -- {'PASS' if chk['R8h_check_pass'] else 'FAIL'}",
-                f"    Margin                  : {chk['R8h_check_margin']*1e6:+.3f} uSv/h",
-            ]
-            if not chk["IDR_check_pass"]:
-                report.append(
-                    f"  FAILED: instantaneous IDR exceeds 7.5 uSv/h by "
-                    f"{-chk['IDR_check_margin']*1e6:.3f} uSv/h. Thicken the door."
-                )
-            if not chk["R8h_check_pass"]:
-                report.append(
-                    f"  FAILED: R8h exceeds 0.5 uSv/h by "
-                    f"{-chk['R8h_check_margin']*1e6:.3f} uSv/h. Thicken the door."
-                )
 
             report += [
                 "=" * 65,
@@ -2087,23 +2158,17 @@ class Step_M_Results(WizardStep):
 # ==============================================================================
 # N STEP 1 : NEUTRON AND CAPTURE GAMMA AT THE DOOR
 # ------------------------------------------------------------------------------
-# Only reached when E_max >= 10 MV. Extends the M-branch photon result with
-# neutron and capture-gamma dose through the door.
+# Only reached when E_max >= 10 MV. Adds neutron and capture-gamma dose at the
+# door to the M-branch photon result.
 #
-# S_0 and S_1 are NOT re-asked here. S_0 = Az and S_1 = A1 from
-# Step_M_Geometry describe the same maze opening. Re-typing them risked the
-# two numbers drifting apart, so this step reads them from wizard.data.
+# S_0 = Az comes from Step_M_Geometry (same maze opening), so it is read
+# from wizard.data and not asked again. S_1 = w_1_n x h_e, see get_data.
 #
-# Modified Kersey method (Wu & McGinley), reproduced term by term against
-# the NCRP 151 worked example (Varian 1800, Sec 7.1.11-7.1.12).
-# Constant is 2.4e-15, not 2.4 * 10e-15 (potato's version evaluated to
-# 1e-14, ten times too large -- Python does not read "10e-15" as "times ten
-# to the minus fifteen"). The S0/S1 ratio carries NO square root - the
-# worked example only reproduces without it. phi_A third term uses 1.3,
-# confirmed by the same worked example.
-#
-# Design goal allocation: neutrons and capture gamma each take P/2, sharing
-# the goal with photons (Agios Andreas convention). See Step_M_Calculations.
+# Neutrons: modified Kersey method (Wu & McGinley), H_n,D with constant 2.4e-15.
+# NCRP 151 Sec 2.4.2.2.2, Eq 2.19, with sqrt(S_0/S_1).
+# Capture gamma: TVD_cg = 5.4 m.
+# Neutrons and capture gamma each take P/2 of the design goal, shared with
+# photons. See Step_M_Calculations.
 # ==============================================================================
 
 class Step_N_Params(WizardStep):
@@ -2114,10 +2179,11 @@ class Step_N_Params(WizardStep):
         self.frame = ttk.Frame(parent)
         self._results: dict = {}
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Neutron and Capture Gamma Parameters",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         canvas = tk.Canvas(self.frame, highlightthickness=0)
         scrollbar = ttk.Scrollbar(self.frame, orient="vertical", command=canvas.yview)
@@ -2129,14 +2195,16 @@ class Step_N_Params(WizardStep):
         self._entries = {}
         self._reasons = {}
 
-        def row(label_text: str, key: str, minv=None, maxv=None, default="", tooltip=""):
+        def row(label_text: str, key: str, minv=None, maxv=None, default="", tooltip="",
+                example=None):
             r = ttk.Frame(scroll)
             r.pack(fill="x", pady=2)
             ttk.Label(r, text=label_text, width=40, anchor="w").pack(side="left")
             reason = ttk.Label(r, text="", foreground="red", font=("Segoe UI", 8))
             entry = _ValidatedEntry(r, minv=minv, maxv=maxv,
                                     label=label_text.rstrip(":"),
-                                    reason_widget=reason, width=14)
+                                    reason_widget=reason, width=14,
+                                    example=example)
             if default != "":
                 entry.insert(0, str(default))
             else:
@@ -2144,20 +2212,32 @@ class Step_N_Params(WizardStep):
             entry.pack(side="left", padx=4)
             reason.pack(side="left")
             if tooltip:
-                _Tooltip(entry, tooltip)
+                _Tooltip(entry, tooltip + (f"\nPowers of ten: {example}" if example else ""))
+            if example:
+                # Shown permanently: nobody hovers over a field they think they understand.
+                # Blank label of the same width keeps the hint under the entry on any font.
+                h = ttk.Frame(scroll)
+                h.pack(fill="x")
+                ttk.Label(h, text="", width=40).pack(side="left")
+                ttk.Label(
+                    h, text=f"Write as {example}", foreground="#555555",
+                    font=("Segoe UI", 8, "italic"),
+                ).pack(side="left", padx=4)
             self._entries[key] = entry
             self._reasons[key] = reason
 
         row("beta, head transmission factor:", "beta", minv=0.0, maxv=1.0,
             tooltip="1.0 for lead head shielding, 0.85 for tungsten.")
         row("Q_n, neutron source strength:", "Q_n", minv=0.0,
-            tooltip="Neutrons per Gy of photons at isocentre. Vendor-specific, energy-dependent.")
+            tooltip="Neutrons per Gy of photons at isocentre. Vendor-specific, energy-dependent.",
+            example="1.2e12 or 1.2x10^12")
         row("d_n_1, isocentre to maze entrance [m]:", "d_n_1", minv=0.001,
             tooltip="Distance from isocentre to the maze entrance plane.")
         row("d_n_2, maze entrance to door [m]:", "d_n_2", minv=0.001,
             tooltip="Distance from the maze entrance plane to the door.")
         row("K, capture gamma ratio:", "K", minv=0.0,
-            tooltip="Ratio of capture gamma dose equivalent to total neutron fluence at the maze entrance.")
+            tooltip="Ratio of capture gamma dose equivalent to total neutron fluence at the maze entrance.",
+            example="6.9e-16 or 6.9x10^-16")
         row("w_1_n, maze width at room entrance [m]:", "w_1_n", minv=0.001,
             tooltip="Width of the maze corridor specifically where it meets the room. "
                     "Can differ from the M-branch corridor width if the maze narrows "
@@ -2168,16 +2248,15 @@ class Step_N_Params(WizardStep):
         row("Rr_W, room width [m]:", "Rr_W", minv=0.001)
         row("Rr_H, room height [m]:", "Rr_H", minv=0.001)
 
-        note = ttk.Label(
+        note = WrapLabel(
             scroll, foreground="#555555", font=("Segoe UI", 8, "italic"),
-            wraplength=520, justify="left",
             text=(
                 "S_0 is taken from the maze geometry entered earlier (Az) and "
                 "is not asked again here. S_1 uses the width entered above, "
                 "not a value from the M-branch - see its tooltip for why."
             ),
         )
-        note.pack(anchor="w", padx=4, pady=(8, 4))
+        note.pack(fill="x", padx=4, pady=(8, 4))
 
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -2191,7 +2270,7 @@ class Step_N_Params(WizardStep):
         return all(entry._check() for entry in self._entries.values())
 
     def get_data(self) -> dict:
-        d = {key: float(entry.get().strip()) for key, entry in self._entries.items()}
+        d = {key: entry.value() for key, entry in self._entries.items()}
         w = self.wizard.data
 
         # S_0 = Az (maze corridor cross-section at the room-side opening)
@@ -2215,8 +2294,7 @@ class Step_N_Params(WizardStep):
         TVD_n = 2.06 * math.sqrt(S_1)
         d["TVD_n"] = TVD_n
 
-        # Modified Kersey, Wu & McGinley. Direct + wall-reflected + thermal.
-        # Third coefficient 1.3, confirmed by the NCRP worked example.
+        # Fluence per unit dose: direct + wall-reflected + thermal terms.
         phi_A = (
             (d["beta"] * d["Q_n"]) / (4.0 * math.pi * (d["d_n_1"] ** 2))
             + (5.4 * d["beta"] * d["Q_n"]) / (2.0 * math.pi * S_r)
@@ -2224,10 +2302,8 @@ class Step_N_Params(WizardStep):
         )
         d["phi_A"] = phi_A
 
-        # Plain S0/S1, no square root. The NCRP worked example only
-        # reproduces without it - the thesis version was wrong.
         H_n_D = (
-            2.4 * 10e-15 * math.sqrt(S_0 / S_1) * phi_A
+            2.4e-15 * math.sqrt(S_0 / S_1) * phi_A
             * (1.64 * (10.0 ** (-(d["d_n_2"] / 1.9))) + (10.0 ** (-(d["d_n_2"] / TVD_n))))
         )
         d["H_n_D"] = H_n_D
@@ -2252,12 +2328,12 @@ class Step_N_Params(WizardStep):
             x_n_concrete = N_n * 15.0
         d["x_n_PBE"], d["x_n_concrete"] = x_n_PBE, x_n_concrete
 
-        if E_min >= 10.0:
-            DR_n = (w["Ddot0_max"] + w["Ddot0_min"]) * H_n_D
-        else:
-            DR_n = w["Ddot0_max"] * H_n_D
-        IDR_n = DR_n * 10.0 ** (-x_n_PBE / 4.5)
-        d["DR_n"], d["IDR_n"] = DR_n, IDR_n
+        # [IDR] if E_min >= 10.0:
+            # [IDR] DR_n = (w["Ddot0_max"] + w["Ddot0_min"]) * H_n_D
+        # [IDR] else:
+            # [IDR] DR_n = w["Ddot0_max"] * H_n_D
+        # [IDR] IDR_n = DR_n * 10.0 ** (-x_n_PBE / 4.5)
+        # [IDR] d["DR_n"], d["IDR_n"] = DR_n, IDR_n
 
         # Capture gamma only above 10 MV. At exactly 10 MV, photoneutron
         # production is not yet significant enough to pose a capture-gamma
@@ -2292,12 +2368,12 @@ class Step_N_Params(WizardStep):
             d["x_cg_concrete"] = x_cg_concrete
             d["x_cg_steel"] = x_cg_steel
 
-            if E_min >= 10.0:
-                DR_cg = (w["Ddot0_max"] + w["Ddot0_min"]) * h_phi
-            else:
-                DR_cg = w["Ddot0_max"] * h_phi
-            IDR_cg = DR_cg * 10.0 ** (-x_cg_lead / 6.1)
-            d["DR_cg"], d["IDR_cg"] = DR_cg, IDR_cg
+            # [IDR] if E_min >= 10.0:
+                # [IDR] DR_cg = (w["Ddot0_max"] + w["Ddot0_min"]) * h_phi
+            # [IDR] else:
+                # [IDR] DR_cg = w["Ddot0_max"] * h_phi
+            # [IDR] IDR_cg = DR_cg * 10.0 ** (-x_cg_lead / 6.1)
+            # [IDR] d["DR_cg"], d["IDR_cg"] = DR_cg, IDR_cg
 
         self._results = d
         return d
@@ -2320,10 +2396,11 @@ class Step_N_Results(WizardStep):
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Required Door Shielding: Photon + Neutron + Capture Gamma",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 10))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 10), fill="x")
 
         text_frame = ttk.Frame(self.frame)
         text_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -2338,6 +2415,7 @@ class Step_N_Results(WizardStep):
         btn_frame.pack(pady=15)
         ttk.Button(btn_frame, text="Restart", command=self.wizard.restart_workflow).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Back", command=self.wizard.prev_step).pack(side="left", padx=5)
+        _add_export_buttons(btn_frame, self.text_area)
 
     def show(self) -> None:
         super().show()
@@ -2347,11 +2425,11 @@ class Step_N_Results(WizardStep):
         d = self.wizard.data
         try:
             x_ph = d["x_ph_lead"]
-            idr_ph = d["IDR_ph"]
+            # [IDR] idr_ph = d["IDR_ph"]
 
             x_n_pbe = d["x_n_PBE"]
             x_n_conc = d["x_n_concrete"]
-            idr_n = d["IDR_n"]
+            # [IDR] idr_n = d["IDR_n"]
 
             cg_skipped = d.get("cg_skipped", False)
 
@@ -2371,7 +2449,7 @@ class Step_N_Results(WizardStep):
                 f"  Calculated                : {x_ph:.2f} cm Pb",
                 f"  Plus 1 HVL margin         : {ph_margin:.2f} cm Pb",
                 f"  Recommended total         : {x_ph + ph_margin:.2f} cm Pb",
-                f"  IDR                       : {idr_ph:.3e} Sv/h ({idr_ph*1e6:.2f} uSv/h)",
+                # [IDR] f"  IDR                       : {idr_ph:.3e} Sv/h ({idr_ph*1e6:.2f} uSv/h)",
                 "-" * 65,
                 "NEUTRONS",
                 f"  Calculated (PBE)          : {x_n_pbe:.2f} cm PBE",
@@ -2379,7 +2457,7 @@ class Step_N_Results(WizardStep):
                 f"  Recommended total         : {x_n_pbe + n_pbe_margin:.2f} cm PBE",
                 f"  Equivalent (concrete)     : {x_n_conc:.2f} cm, "
                 f"+{n_conc_margin:.2f} HVL = {x_n_conc + n_conc_margin:.2f} cm",
-                f"  IDR                       : {idr_n:.3e} Sv/h ({idr_n*1e6:.2f} uSv/h)",
+                # [IDR] f"  IDR                       : {idr_n:.3e} Sv/h ({idr_n*1e6:.2f} uSv/h)",
                 "-" * 65,
                 "CAPTURE GAMMA",
             ]
@@ -2391,14 +2469,14 @@ class Step_N_Results(WizardStep):
                     "  enough to pose a capture-gamma radiological hazard",
                     "  (Deye and Young, 1977).",
                 ]
-                idr_cg = 0.0
-                dr_cg = 0.0
+                # [IDR] idr_cg = 0.0
+                # [IDR] dr_cg = 0.0
             else:
                 x_cg_pb = d["x_cg_lead"]
                 x_cg_conc = d["x_cg_concrete"]
                 x_cg_steel = d["x_cg_steel"]
-                idr_cg = d["IDR_cg"]
-                dr_cg = d["DR_cg"]
+                # [IDR] idr_cg = d["IDR_cg"]
+                # [IDR] dr_cg = d["DR_cg"]
                 cg_pb_margin = m * 6.1
                 cg_conc_margin = m * 33.0
                 cg_steel_margin = m * 10.0
@@ -2409,37 +2487,9 @@ class Step_N_Results(WizardStep):
                     f"+{cg_conc_margin:.2f} HVL = {x_cg_conc + cg_conc_margin:.2f} cm",
                     f"  Steel                     : {x_cg_steel:.2f} cm, "
                     f"+{cg_steel_margin:.2f} HVL = {x_cg_steel + cg_steel_margin:.2f} cm",
-                    f"  IDR                       : {idr_cg:.3e} Sv/h ({idr_cg*1e6:.2f} uSv/h)",
+                    # [IDR] f"  IDR                       : {idr_cg:.3e} Sv/h ({idr_cg*1e6:.2f} uSv/h)",
                 ]
             
-            # IPEM checks: shielded IDRs against the instantaneous limit,
-            # unshielded rates times beam-on hours against the daily average.
-            idr_total = idr_ph + d["IDR_n"] + idr_cg
-            dr_total = d["DR_ph"] + d["DR_n"] + dr_cg
-            chk = ipem_idr_checks(idr_total, dr_total, d["weekly_beam_on_hours"])
-
-            report += [
-                "-" * 65,
-                "IPEM IDR COMPLIANCE",
-                f"  IDR total (shielded)      : {idr_total*1e6:.3f} uSv/h "
-                f"(limit 7.5) -- {'PASS' if chk['IDR_check_pass'] else 'FAIL'}",
-                f"    Margin                  : {chk['IDR_check_margin']*1e6:+.3f} uSv/h",
-                f"  Weekly beam-on time       : {d['weekly_beam_on_hours']:.2f} h",
-                f"  Rw (weekly, unshielded)   : {chk['Rw']*1e6:.3f} uSv",
-                f"  R8h (daily-averaged)      : {chk['R8h']*1e6:.3f} uSv/h "
-                f"(limit 0.5) -- {'PASS' if chk['R8h_check_pass'] else 'FAIL'}",
-                f"    Margin                  : {chk['R8h_check_margin']*1e6:+.3f} uSv/h",
-            ]
-            if not chk["IDR_check_pass"]:
-                report.append(
-                    f"  FAILED: instantaneous IDR exceeds 7.5 uSv/h by "
-                    f"{-chk['IDR_check_margin']*1e6:.3f} uSv/h. Thicken the door."
-                )
-            if not chk["R8h_check_pass"]:
-                report.append(
-                    f"  FAILED: R8h exceeds 0.5 uSv/h by "
-                    f"{-chk['R8h_check_margin']*1e6:.3f} uSv/h. Thicken the door."
-                )
 
             report += [
                 "=" * 65,
@@ -2482,19 +2532,20 @@ class Step_D_Primary(WizardStep):
 
         self._yes_count = 0
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Primary Beam at Door",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         self._primary_at_door = tk.BooleanVar(value=False)
 
         radio_frame = ttk.Frame(self.frame)
-        radio_frame.pack(anchor="w", padx=20, pady=10)
-        ttk.Label(
+        radio_frame.pack(fill="x", padx=20, pady=10)
+        WrapLabel(
             radio_frame,
             text="Does the primary beam reach the door directly?",
-        ).pack(side="left", padx=(0, 15))
+        ).pack(side="left", padx=(0, 15), fill="x", expand=True)
         ttk.Radiobutton(
             radio_frame, text="Yes", variable=self._primary_at_door,
             value=True,
@@ -2504,11 +2555,11 @@ class Step_D_Primary(WizardStep):
             value=False,
         ).pack(side="left", padx=5)
 
-        self._reason = ttk.Label(
+        self._reason = WrapLabel(
             self.frame, text="", foreground="red",
-            font=("Segoe UI", 10), wraplength=500, justify="left",
+            font=("Segoe UI", 10),
         )
-        self._reason.pack(anchor="w", padx=20, pady=(0, 10))
+        self._reason.pack(fill="x", padx=20, pady=(0, 10))
 
         btn_frame = ttk.Frame(self.frame)
         btn_frame.pack(pady=15)
@@ -2565,10 +2616,11 @@ class Step_D_Geometry(WizardStep):
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Direct Door Geometry",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 5))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 5), fill="x")
 
         self._entries = {}
         self._reasons = {}
@@ -2650,10 +2702,11 @@ class Step_D_Calculations(WizardStep):
         self.frame = ttk.Frame(parent)
         self._results: dict = {}
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Direct Door Dose and Thickness",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 10))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 10), fill="x")
 
         text_frame = ttk.Frame(self.frame)
         text_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -2751,15 +2804,15 @@ class Step_D_Calculations(WizardStep):
                 t_final = max(t_ps, t_L) + hvl_ctrl
                 rule_note = f"Difference < 1 TVL. Added 1 HVL ({hvl_ctrl:.2f} cm) to the larger."
 
-            # Instantaneous dose rate. D0 plays the role W plays above.
-            # Each component decays through its own TVL, not a shared one.
-            D0_max = d["Ddot0_max"]
-            IDR_ps_unshielded = (D0_max * a * (F / 400.0)) / ((d_sca ** 2) * (d_sec ** 2))
-            IDR_L_unshielded = (D0_max * L_f) / (d_L ** 2)
+            # [IDR] # Instantaneous dose rate. D0 plays the role W plays above.
+            # [IDR] # Each component decays through its own TVL, not a shared one.
+            # [IDR] D0_max = d["Ddot0_max"]
+            # [IDR] IDR_ps_unshielded = (D0_max * a * (F / 400.0)) / ((d_sca ** 2) * (d_sec ** 2))
+            # [IDR] IDR_L_unshielded = (D0_max * L_f) / (d_L ** 2)
 
-            IDR_ps = IDR_ps_unshielded * transmission_scatter(t_final)
-            IDR_L = IDR_L_unshielded * transmission_leakage(t_final)
-            IDR_total = IDR_ps + IDR_L
+            # [IDR] IDR_ps = IDR_ps_unshielded * transmission_scatter(t_final)
+            # [IDR] IDR_L = IDR_L_unshielded * transmission_leakage(t_final)
+            # [IDR] IDR_total = IDR_ps + IDR_L
 
             self._results = {
                 "a_scatter": a, "H_ps": H_ps, "H_L": H_L,
@@ -2767,7 +2820,7 @@ class Step_D_Calculations(WizardStep):
                 "n_ps": n_ps, "n_L": n_L, "t_ps": t_ps, "t_L": t_L,
                 "t_final": t_final,
                 "TVL_s": TVL_s, "TVL_L1": TVL_L1, "TVL_Le": TVL_Le,
-                "IDR_ps": IDR_ps, "IDR_L": IDR_L, "IDR_total": IDR_total,
+                # [IDR] "IDR_ps": IDR_ps, "IDR_L": IDR_L, "IDR_total": IDR_total,
             }
 
             report = [
@@ -2787,11 +2840,11 @@ class Step_D_Calculations(WizardStep):
                 "Two-source rule (NCRP 151 Sec 2.3):",
                 f"  {rule_note}",
                 f"  Combined barrier thickness      : {t_final:.2f} cm",
-                "-" * 65,
-                "IDR through combined barrier (per-component TVLs):",
-                f"  Scatter   : {IDR_ps:.3e} Sv/h",
-                f"  Leakage   : {IDR_L:.3e} Sv/h",
-                f"  Total     : {IDR_total:.3e} Sv/h ({IDR_total*1e6:.2f} uSv/h)",
+                # [IDR] "-" * 65,
+                # [IDR] "IDR through combined barrier (per-component TVLs):",
+                # [IDR] f"  Scatter   : {IDR_ps:.3e} Sv/h",
+                # [IDR] f"  Leakage   : {IDR_L:.3e} Sv/h",
+                # [IDR] f"  Total     : {IDR_total:.3e} Sv/h ({IDR_total*1e6:.2f} uSv/h)",
                 "=" * 65,
             ]
             self.text_area.delete("1.0", "end")
@@ -2816,16 +2869,17 @@ class Step_D_Calculations(WizardStep):
 # ==============================================================================
 
 class Step_D_Results(WizardStep):
-    """Final direct-door result: combined barrier thickness and IDR."""
+    """Final direct-door result: combined barrier thickness."""
 
     def __init__(self, parent: tk.Frame, wizard: 'ShieldingWizard') -> None:
         super().__init__(parent, wizard)
         self.frame = ttk.Frame(parent)
 
-        ttk.Label(
+        WrapLabel(
             self.frame, text="Required Door Shielding: Direct Line of Sight",
             font=("Segoe UI", 12, "bold"),
-        ).pack(pady=(15, 10))
+            justify="center", anchor="center",
+        ).pack(pady=(15, 10), fill="x")
 
         text_frame = ttk.Frame(self.frame)
         text_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -2840,6 +2894,7 @@ class Step_D_Results(WizardStep):
         btn_frame.pack(pady=15)
         ttk.Button(btn_frame, text="Restart", command=self.wizard.restart_workflow).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Back", command=self.wizard.prev_step).pack(side="left", padx=5)
+        _add_export_buttons(btn_frame, self.text_area)
 
     def show(self) -> None:
         super().show()
@@ -2860,9 +2915,9 @@ class Step_D_Results(WizardStep):
                 f"Combined barrier thickness : {d['t_final']:.2f} cm "
                 f"(TVL_s={d['TVL_s']:.1f}, TVL_L1={d['TVL_L1']:.1f}, "
                 f"TVL_Le={d['TVL_Le']:.1f})",
-                "-" * 65,
-                f"IDR at the door            : {d['IDR_total']:.3e} Sv/h "
-                f"({d['IDR_total']*1e6:.2f} uSv/h)",
+                # [IDR] "-" * 65,
+                # [IDR] f"IDR at the door            : {d['IDR_total']:.3e} Sv/h "
+                # [IDR] f"({d['IDR_total']*1e6:.2f} uSv/h)",
                 "=" * 65,
                 "",
                 "TVLs are NCRP 151 Table B.5 (leakage and scattered photons,",
@@ -2931,11 +2986,23 @@ class ShieldingWizard(tk.Tk):
         self.current_step_index: int = 0
         self.step_history: list[int] = []
         self.steps: list[WizardStep] = []
+        # Values typed into steps that Back destroyed, by step class name.
+        self.saved_inputs: dict[str, dict] = {}
 
-        # Nav bar packed first at the bottom so the container fills the rest.
-        self.nav_frame = ttk.Frame(self, padding=(8, 4))
-        self.nav_frame.pack(side="bottom", fill="x")
+        # Bottom bar packed first so the container fills the rest. Nav squares
+        # on the left are rebuilt on every move; Cancel/Exit on the right stay.
+        bottom = ttk.Frame(self, padding=(8, 4))
+        bottom.pack(side="bottom", fill="x")
         ttk.Separator(self, orient="horizontal").pack(side="bottom", fill="x")
+        actions = ttk.Frame(bottom)
+        actions.pack(side="right")
+        ttk.Button(actions, text="Cancel", command=self.cancel_workflow).pack(side="left", padx=2)
+        ttk.Button(actions, text="Exit", command=self.confirm_exit).pack(side="left", padx=2)
+        self.nav_frame = ttk.Frame(bottom)
+        self.nav_frame.pack(side="left", fill="x", expand=True)
+
+        # Window close button gets the same question as Exit.
+        self.protocol("WM_DELETE_WINDOW", self.confirm_exit)
 
         self.container = ttk.Frame(self)
         self.container.pack(side="top", fill="both", expand=True)
@@ -2952,6 +3019,7 @@ class ShieldingWizard(tk.Tk):
                 step.frame.destroy()
 
         self.data = {}
+        self.saved_inputs = {}
         self.steps = [Step_BranchSelector(self.container, self)]
         self.current_step_index = 0
         self.step_history = [0]
@@ -2964,6 +3032,7 @@ class ShieldingWizard(tk.Tk):
             if step.frame:
                 step.frame.destroy()
         self.data = {}
+        self.saved_inputs = {}   # Restart means a fresh calculation
         self.steps = self.steps[:1]
         self.current_step_index = 0
         self.step_history = [0]
@@ -2987,8 +3056,10 @@ class ShieldingWizard(tk.Tk):
             name = type(step).__name__
             text = _NAV_LABELS.get(name, name)
             is_current = (i == self.current_step_index)
+            # Sized to the label, not fixed: a full N-branch run is 12 squares
+            # plus Cancel/Exit, and fixed-width squares ran off the window.
             btn = tk.Button(
-                self.nav_frame, text=text, width=8,
+                self.nav_frame, text=text, padx=6,
                 relief="sunken" if is_current else "raised",
                 bg="#dbe6f5" if is_current else "#f0f0f0",
                 activebackground="#c9d9ef",
@@ -3005,10 +3076,7 @@ class ShieldingWizard(tk.Tk):
         if index >= self.current_step_index:
             return
         for step in reversed(self.steps[index + 1:]):
-            step.rollback_data(self.data)
-            step.hide()
-            if step.frame:
-                step.frame.destroy()
+            self._discard_step(step)
         self.steps = self.steps[:index + 1]
         while self.step_history and self.step_history[-1] != index:
             self.step_history.pop()
@@ -3097,16 +3165,14 @@ class ShieldingWizard(tk.Tk):
             self._advance_to_next_available()
 
     def prev_step(self) -> None:
-        """Go back and destroy later steps so they rebuild against fresh data."""
+        """Go back and destroy later steps so they rebuild against fresh data.
+        What the user typed into them survives in saved_inputs."""
         if len(self.step_history) > 1:
             self.step_history.pop()
             prev_idx = self.step_history[-1]
 
             for step in reversed(self.steps[prev_idx + 1:]):
-                step.rollback_data(self.data)
-                step.hide()
-                if step.frame:
-                    step.frame.destroy()
+                self._discard_step(step)
 
             self.steps = self.steps[:prev_idx + 1]
             self.current_step_index = prev_idx
@@ -3118,7 +3184,19 @@ class ShieldingWizard(tk.Tk):
         for step in self.steps:
             if isinstance(step, step_class):
                 return
-        self.steps.append(step_class(self.container, self))
+        step = step_class(self.container, self)
+        saved = self.saved_inputs.get(step_class.__name__)
+        if saved and step.frame:
+            _restore_inputs(step.frame, saved)
+        self.steps.append(step)
+
+    def _discard_step(self, step: WizardStep) -> None:
+        """Roll back a step's data and destroy it, keeping what the user typed."""
+        step.rollback_data(self.data)
+        step.hide()
+        if step.frame:
+            self.saved_inputs[type(step).__name__] = _snapshot_inputs(step.frame)
+            step.frame.destroy()
 
     def _advance_to_step(self, index: int) -> None:
         self.step_history.append(index)
@@ -3131,6 +3209,17 @@ class ShieldingWizard(tk.Tk):
     def exit_wizard(self) -> None:
         self.quit()
         self.destroy()
+
+    def confirm_exit(self) -> None:
+        if messagebox.askyesno("Exit", "Close the wizard?\nAnything not copied or saved is lost."):
+            self.exit_wizard()
+
+    def cancel_workflow(self) -> None:
+        """Abandon this calculation and go back to the start screen."""
+        if self.current_step_index == 0:
+            return   # already at the start, nothing to cancel
+        if messagebox.askyesno("Cancel", "Cancel this calculation?\nAll entered values are cleared."):
+            self.initialize_wizard()
 
 
 # ==============================================================================
