@@ -15,3 +15,8 @@ Thumbs.db
 # IDE configurations
 .vscode/
 .idea/
+
+# PyInstaller output
+build/
+dist/
+*.spec

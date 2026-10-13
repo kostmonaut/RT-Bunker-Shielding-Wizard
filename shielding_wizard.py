@@ -106,44 +106,50 @@ def lookup_tvl(energy_mv: float) -> tuple[float, float]:
     )
 
 
-# Leakage and scattered-photon TVLs, Table B.5, NCRP 151, concrete only.
-# The primary-beam TVL table is the WRONG table for the D-branch. Leaked and
-# scattered photons are softer than the primary beam and attenuate faster,
-# with their own TVLs, angle-dependent for scatter. Digitised at 6 and 18 MV
-# only, concrete only. 10 MV is not covered -- if selected, the D-branch
-# raises a clear error rather than silently reusing an adjacent energy's numbers.
-_TVL_LEAKAGE_SCATTER_TABLE = {
-    # energy_mv : (TVLl1, TVLle, TVLs20, TVLs90)  -- concrete, cm
-    6:  (34, 29, 31.3, 17),
-    18: (36, 34, 40.0, 19),
+# Patient-scattered photon TVLs in concrete (cm), NCRP 151 Table B.5a.
+# Scattered photons are softer than the primary beam and attenuate faster, and
+# the TVL depends on the scatter angle. Columns are the B.4 energies.
+_TVL_SCATTER_B5A = {
+    # angle : {MV: TVL cm}
+    15:  {6: 34, 10: 39, 18: 44, 24: 49},
+    30:  {6: 26, 10: 28, 18: 32, 24: 36},
+    45:  {6: 23, 10: 25, 18: 27, 24: 29},
+    60:  {6: 21, 10: 22, 18: 23, 24: 24},
+    90:  {6: 17, 10: 18, 18: 19, 24: 19},
+    135: {6: 15, 10: 15, 18: 15, 24: 16},
 }
 
 
 def lookup_tvl_leakage(energy_mv: float) -> tuple[float, float]:
-    """Return (TVLl1, TVLle) in cm of concrete for head-leakage photons."""
-    row = _TVL_LEAKAGE_SCATTER_TABLE.get(energy_mv)
-    if row is None:
-        raise ValueError(
-            f"No leakage TVL data for {energy_mv} MV. Only 6 and 18 MV concrete "
-            f"are digitised (Table B.5). 10 MV is a known gap, not a bug."
-        )
-    return row[0], row[1]
+    """Return (TVL1, TVLe) in cm of concrete for head-leakage photons (Table B.7)."""
+    return lookup_tvl(energy_mv)
 
 
 def lookup_tvl_scatter(energy_mv: float, scatter_angle_deg: float) -> float:
     """
-    Return a single TVL in cm of concrete for scattered photons at a given
-    scatter angle. Rounds to the nearest of the two measured angles (20, 90),
-    midpoint at 55 deg.
+    Return the TVL in cm of concrete for patient-scattered photons, Table B.5a.
+    Angle rounds to the nearest tabulated value (midpoints round up); angles
+    outside 15-135 deg use the nearest end row.
     """
-    row = _TVL_LEAKAGE_SCATTER_TABLE.get(energy_mv)
-    if row is None:
+    if energy_mv not in _TVL_SCATTER_B5A[15]:
         raise ValueError(
-            f"No scattered-photon TVL data for {energy_mv} MV. Only 6 and 18 MV "
-            f"concrete are digitised (Table B.5). 10 MV is a known gap, not a bug."
+            f"No scattered-photon TVL for {energy_mv} MV in Table B.5a. "
+            f"Valid energies: {sorted(_TVL_SCATTER_B5A[15])}"
         )
-    _, _, tvl_s20, tvl_s90 = row
-    return tvl_s20 if scatter_angle_deg < 55.0 else tvl_s90
+    th = scatter_angle_deg
+    if th < 22.5:
+        key = 15
+    elif th < 37.5:
+        key = 30
+    elif th < 52.5:
+        key = 45
+    elif th < 75.0:
+        key = 60
+    elif th < 112.5:
+        key = 90
+    else:
+        key = 135
+    return _TVL_SCATTER_B5A[key][energy_mv]
 
 
 # ==============================================================================
@@ -226,88 +232,6 @@ def lookup_scatter_fraction_b4(scatter_angle: float, energy_mv: float) -> float:
 
 
 # ==============================================================================
-# POTATO'S PATIENT-SCATTER ALBEDO -- deliberate, isolated exception
-# ------------------------------------------------------------------------------
-# H_PS uses a SECOND, DIFFERENT lookup of Table B.4 than the one above. Potato
-# ran the B.4 table (keyed angle-then-energy) through its wall-albedo lookup
-# function, which does true bilinear interpolation over BOTH axes with no
-# exact-match requirement. Since B.4's outer keys are angles and inner keys
-# are energies, this reads the angle argument against the energy axis and
-# vice versa -- semantically wrong, but it is what the verified reference
-# case actually used, and it reproduces the confirmed thickness (0.71 cm)
-# exactly. Our own nearest-neighbour lookup_scatter_fraction_b4 above cannot
-# reproduce this number: it is a different algorithm (bucket rounding, not
-# interpolation), not just a different table.
-#
-# This function exists ONLY to reproduce that one verified quantity. It is
-# not a general-purpose replacement for lookup_albedo or lookup_scatter_
-# fraction_b4, and should not be reused elsewhere. "No interpolation" stays
-# the rule everywhere else in this file; this is the one deliberate,
-# documented exception, kept because potato worked.
-# ==============================================================================
-
-def lookup_alpha_theta_potato(scatter_angle_deg: float, energy_mv: float) -> float:
-    """
-    Reproduces potato's H_PS scatter coefficient exactly: bilinear
-    interpolation of ALBEDO_SCATTER_TABLE_B4 with angle and energy read
-    against each other's axis. Verified: (10, 18) -> 0.007952.
-    """
-    table = ALBEDO_SCATTER_TABLE_B4
-    energies = sorted(table.keys())
-    angles = sorted(next(iter(table.values())).keys())
-
-    lower_e = upper_e = None
-    for e in energies:
-        if energy_mv == e:
-            lower_e = upper_e = e
-            break
-        if energy_mv > e:
-            lower_e = e
-        elif energy_mv < e and upper_e is None:
-            upper_e = e
-    if lower_e is None:
-        lower_e = upper_e = energies[0]
-    if upper_e is None:
-        lower_e = upper_e = energies[-1]
-
-    lower_a = upper_a = None
-    for a in angles:
-        if scatter_angle_deg == a:
-            lower_a = upper_a = a
-            break
-        if scatter_angle_deg > a:
-            lower_a = a
-        elif scatter_angle_deg < a and upper_a is None:
-            upper_a = a
-    if lower_a is None:
-        lower_a = upper_a = angles[0]
-    if upper_a is None:
-        lower_a = upper_a = angles[-1]
-
-    def gv(e, a):
-        return table[e][a]
-
-    if lower_e == upper_e and lower_a == upper_a:
-        return gv(lower_e, lower_a)
-    elif lower_e == upper_e:
-        v0, v1 = gv(lower_e, lower_a), gv(lower_e, upper_a)
-        t = (scatter_angle_deg - lower_a) / (upper_a - lower_a)
-        return v0 + t * (v1 - v0)
-    elif lower_a == upper_a:
-        v0, v1 = gv(lower_e, lower_a), gv(upper_e, lower_a)
-        t = (energy_mv - lower_e) / (upper_e - lower_e)
-        return v0 + t * (v1 - v0)
-    else:
-        v00, v01 = gv(lower_e, lower_a), gv(lower_e, upper_a)
-        v10, v11 = gv(upper_e, lower_a), gv(upper_e, upper_a)
-        te = (energy_mv - lower_e) / (upper_e - lower_e)
-        ta = (scatter_angle_deg - lower_a) / (upper_a - lower_a)
-        v0 = v00 + ta * (v01 - v00)
-        v1 = v10 + ta * (v11 - v10)
-        return v0 + te * (v1 - v0)
-
-
-# ==============================================================================
 # WALL ALBEDO TABLES - Differential dose albedo coefficients
 # Source: NCRP 151, Tables B.8a-f
 # ------------------------------------------------------------------------------
@@ -323,6 +247,7 @@ def lookup_alpha_theta_potato(scatter_angle_deg: float, energy_mv: float) -> flo
 # Ordinary concrete, normal incidence (0) - Table B.8a
 ALBEDO_CONCRETE_0_TABLE = {
     # energy_mv : {scatter_angle: coefficient}
+    0.5:  {0: 19.0e-3, 30: 17.0e-3, 45: 15.0e-3, 60: 13.0e-3, 75: 8.0e-3},  # 0.5 MeV
     1.25: {0: 7.0e-3, 30: 6.5e-3, 45: 6.0e-3, 60: 5.5e-3, 75: 3.8e-3},  # Co-60
     4:    {0: 6.7e-3, 30: 6.4e-3, 45: 5.8e-3, 60: 4.9e-3, 75: 3.1e-3},
     6:    {0: 5.3e-3, 30: 5.2e-3, 45: 4.7e-3, 60: 4.0e-3, 75: 2.7e-3},
@@ -336,6 +261,7 @@ ALBEDO_CONCRETE_0_TABLE = {
 # No Co-60 entry in NCRP 151 for this configuration.
 ALBEDO_CONCRETE_45_TABLE = {
     # energy_mv : {scatter_angle: coefficient}
+    0.5:  {0: 22.0e-3, 30: 22.5e-3, 45: 22.0e-3, 60: 20.0e-3, 75: 18.0e-3},  # 0.5 MeV
     4:    {0: 7.6e-3, 30: 8.5e-3, 45: 9.0e-3, 60: 9.2e-3, 75: 9.5e-3},
     6:    {0: 6.4e-3, 30: 7.1e-3, 45: 7.3e-3, 60: 7.7e-3, 75: 8.0e-3},
     10:   {0: 5.1e-3, 30: 5.7e-3, 45: 5.8e-3, 60: 6.0e-3, 75: 6.0e-3},
@@ -435,22 +361,15 @@ def lookup_albedo(table: dict, scatter_angle: float, energy_mv: float) -> float:
 # instead of tying it to E_max/E_min.
 # ==============================================================================
 
-# TODO: source NCRP 151 albedo value at true 0.5 MeV. Currently using the
-# Co-60 (1.25 MeV) row as the nearest tabulated stand-in.
-_SOFT_SPECTRUM_MV = 1.25
-
-# Patient-scattered radiation arrives at the maze wall equally soft, so its
-# wall albedo is one fixed value, not an energy-split pair.
-# 0.5 MeV, 25 deg incidence, 0 deg reflection. Verified against a published
-# door dose-rate reference.
-# TODO: source full NCRP 0.5 MeV table.
-ALPHA1_PATIENT_SCATTER = 0.0205
+# 0.5 MeV rows exist for concrete only (NCRP 151 Tables B.8a, B.8b). Iron and
+# lead have none, so they fall back to their softest tabulated energy.
+_SOFT_SPECTRUM_MV = 0.5
 
 
 def lookup_albedo_soft(table: dict, scatter_angle: float) -> float:
     """
     Albedo for degraded-spectrum radiation. Energy fixed at the soft stand-in,
-    not the beam energy. Tables without a Co-60 row fall back to their softest
+    not the beam energy. Tables without a 0.5 MeV row fall back to their softest
     tabulated energy, which is still the least wrong number available.
     """
     energy = _SOFT_SPECTRUM_MV if _SOFT_SPECTRUM_MV in table else min(table.keys())
@@ -804,8 +723,6 @@ RT_CHECKLIST_TEXT = (
     "you through workload estimation, IMRT and TBI corrections, maze geometry, "
     "and door shielding in that order.\n\n"
     "Have the following ready:\n\n"
-    # [IDR] "  -  Beam energies, dose rate at isocentre Ddot0 [Gy/h], and workload "
-    # [IDR] "estimates. If you do not have Ddot0, call the vendor.\n"
     "  -  Beam energies and workload estimates.\n"
     "  -  Bunker floor plan with dimensions. You will need several distances.\n"
     "  -  Design goal P [Sv/week] and occupancy factors. Typical values are "
@@ -986,8 +903,6 @@ class Step_SETUP_Workload(WizardStep):
             tooltip="Treatment days per week [1-7].")
         row("Gy/therapy:",     f"Grays_{suffix}",             minv=0.0, default=2.0,
             tooltip="Absorbed dose per treatment session [Gy].")
-        # [IDR] row("Ddot0 [Gy/h]:",   f"Ddot0_{suffix}",             minv=0.0,
-            # [IDR] tooltip="Instantaneous dose rate at isocentre [Gy/h]. From vendor specs.")
 
     def _toggle_single(self) -> None:
         # Hidden fields keep their defaults; get_data zeroes the slot anyway.
@@ -1040,7 +955,7 @@ class Step_SETUP_Workload(WizardStep):
 # ------------------------------------------------------------------------------
 # If IMRT is not used, all IMRT values are zeroed and W remains unchanged.
 # If IMRT is used, C_I (MU_IMRT/MU_conv) and the IMRT fraction are collected
-# here and F_imrt, W_conv, W_IMRT are calculated inline on advancement.
+# here and W_conv, W_IMRT are calculated inline on advancement.
 # ==============================================================================
 
 class Step_SETUP_IMRT(WizardStep):
@@ -1147,15 +1062,12 @@ class Step_SETUP_IMRT(WizardStep):
             # everything zeroed, W unchanged. C_I is a MU ratio, so the inert
             # value is 1 (no MU inflation), not 0.
             if C_I in (0.0, 1.0):
-                p, C_I, F = 0.0, 1.0, 1.0
+                p, C_I = 0.0, 1.0
             else:
                 p = float(self._entries[f"p_imrt_{k}"].get())
-                # F_imrt: effective workload multiplier accounting for IMRT fraction.
-                F = p * C_I + (1.0 - p)
             out |= {
                 f"p_imrt_{k}":  p,
                 f"C_I_{k}":     C_I,
-                f"F_imrt_{k}":  F,
                 f"W_conv_{k}":  (1.0 - p) * W_base[k],
                 f"W_IMRT_{k}":  p * W_base[k],
             }
@@ -1285,7 +1197,7 @@ class Step_SETUP_TBI(WizardStep):
 # Assembles final W and W_L from all previous corrections.
 #
 # W_L = W_conv + W_tbi + C_I * W_IMRT   (leakage workload, used in L/N branch)
-# W   = W_conv + F_imrt * W_IMRT         (scatter workload, used in M/D branch)
+# W   = W_conv + W_IMRT                  (scatter workload, used in M/D branch)
 # ==============================================================================
 
 class Step_SETUP_Maze(WizardStep):
@@ -1331,8 +1243,9 @@ class Step_SETUP_Maze(WizardStep):
         # W used by scatter-dominated paths (maze photon, direct door).
         W_L_min = d["W_conv_min"] + d["W_tbi_min"] + d["C_I_min"] * d["W_IMRT_min"]
         W_L_max = d["W_conv_max"] + d["W_tbi_max"] + d["C_I_max"] * d["W_IMRT_max"]
-        W_min   = d["W_conv_min"] + d["F_imrt_min"] * d["W_IMRT_min"]
-        W_max   = d["W_conv_max"] + d["F_imrt_max"] * d["W_IMRT_max"]
+        # NCRP 151 Sec 3.2.2: IMRT raises W_L by C_I but leaves W unchanged.
+        W_min   = d["W_conv_min"] + d["W_IMRT_min"]
+        W_max   = d["W_conv_max"] + d["W_IMRT_max"]
 
         return {
             "maze_exists": self._maze_exists.get(),
@@ -1538,9 +1451,8 @@ class Step_M_Geometry(WizardStep):
 
         _soft_note = (
             "Second-reflection radiation is soft (~0.5 MeV) regardless of beam "
-            "energy, so this lookup uses a fixed energy. True 0.5 MeV data is "
-            "not yet digitised; the Co-60 row (or softest tabulated energy) "
-            "stands in for now."
+            "energy, so this lookup uses the fixed 0.5 MeV row of NCRP 151 "
+            "Table B.8a/b (concrete; iron and lead fall back to their softest row)."
         )
         self._add_combo_row(a_frame, "a_z material:", "alpha_z_material", ["concrete", "iron", "lead"],
                             tooltip=_soft_note)
@@ -1554,9 +1466,9 @@ class Step_M_Geometry(WizardStep):
         self._add_combo_row(a_frame, "a0 reflection angle:", "alpha0_scatter_angle", [0, 30, 45, 60, 75])
 
         _a1_note = (
-            "Used for head-leakage scatter only. Patient scatter now uses a "
-            "fixed 0.5 MeV albedo (0.0205, interim value pending the full "
-            "NCRP 0.5 MeV table) and ignores these dropdowns."
+            "Head-leakage scatter uses the beam-energy albedo. Patient scatter "
+            "uses the 0.5 MeV albedo for the same material and angles "
+            "(concrete only; iron and lead fall back to their softest row)."
         )
         self._add_combo_row(a_frame, "a1 material:", "alpha1_material", ["concrete", "iron", "lead"],
                             tooltip=_a1_note)
@@ -1564,6 +1476,18 @@ class Step_M_Geometry(WizardStep):
                             tooltip=_a1_note)
         self._add_combo_row(a_frame, "a1 reflection angle:", "alpha1_scatter_angle", [0, 30, 45, 60, 75],
                             tooltip=_a1_note)
+
+        # --- Door photon energy
+        _door_note = (
+            "Photon energy used to pick the lead TVL at the door. 0.2 MeV: NCRP "
+            "151 Sec 2.4.1 broad-beam data (TVL 0.6 cm). 1 MeV: harder spectrum "
+            "used in the Theagenio INFINITY sheet (2 cm Pb = 1 TVL, TVL 2.0 cm, "
+            "hospital value, not from NCRP 151). Harder is more conservative."
+        )
+        e_frame = ttk.LabelFrame(scroll_content, text="Door Shielding", padding=10)
+        e_frame.pack(fill="x", padx=10, pady=5)
+        self._add_combo_row(e_frame, "Door photon energy:", "door_energy", ["0.2 MeV", "1 MeV"],
+                            tooltip=_door_note)
 
         # --- Geometry guide
         s_frame = ttk.LabelFrame(scroll_content, text="Geometry Guide", padding=10)
@@ -1832,22 +1756,26 @@ class Step_M_Calculations(WizardStep):
             else:
                 B_LT = 10.0 ** (-(1.0 + (t_s_cm - tvl1_lt) / tvle_lt))
 
-            # Patient scatter fraction. Potato's real formula, verified: uses
-            # its bilinear interpolation on Table B.4 with the axes swapped,
-            # not a clean nearest-neighbour lookup. See lookup_alpha_theta_potato.
-            alpha_theta = lookup_alpha_theta_potato(s_theta, E_max)
+            # Patient scatter fraction, NCRP 151 Table B.4 (same lookup as the D-branch).
+            # Taken per energy, as in NCRP 151 Sec 7.1.10.3: <Wa> = W(E1)a(E1) + W(E2)a(E2).
+            alpha_theta_max = lookup_scatter_fraction_b4(s_theta, E_max)
+            alpha_theta_min = lookup_scatter_fraction_b4(s_theta, E_min)
 
             # Wall albedo. Tables already carry x10^-3, so no rescaling.
             a_z_tbl = _ALBEDO_TABLE_MAP[(d["alpha_z_material"], d["alpha_z_angle"])]
             a0_tbl = _ALBEDO_TABLE_MAP[(d["alpha0_material"], d["alpha0_angle"])]
             a1_tbl = _ALBEDO_TABLE_MAP[(d["alpha1_material"], d["alpha1_angle"])]
 
-            # Second reflection sees a soft spectrum, not the beam energy.
-            alpha_z = lookup_albedo(a_z_tbl, d["alpha_z_scatter_angle"], E_max)
+            # Second reflection sees a soft spectrum, not the beam energy
+            # (NCRP 151 Sec 2.4.1: 0.5 MeV).
+            alpha_z = lookup_albedo_soft(a_z_tbl, d["alpha_z_scatter_angle"])
             alpha0_max = lookup_albedo(a0_tbl, d["alpha0_scatter_angle"], E_max)
             alpha0_min = lookup_albedo(a0_tbl, d["alpha0_scatter_angle"], E_min)
             alpha1_max = lookup_albedo(a1_tbl, d["alpha1_scatter_angle"], E_max)
             alpha1_min = lookup_albedo(a1_tbl, d["alpha1_scatter_angle"], E_min)
+            # Patient-scattered photons reach the maze wall at ~0.5 MeV. NCRP 151
+            # Sec 2.4.2.2.1 / Eq 2.11: 0.5 MeV is the conservative choice.
+            alpha1_ps = lookup_albedo_soft(a1_tbl, d["alpha1_scatter_angle"])
 
             # Eq 3.5: scatter off the opposing wall, then off the maze wall.
             H_s = (
@@ -1860,15 +1788,12 @@ class Step_M_Calculations(WizardStep):
                 L_f * (W_L_max * alpha1_max + W_L_min * alpha1_min) * U_G * A1
             ) / ((d_sec * d_zz) ** 2)
 
-            # Eq 3.7: patient scatter off the maze wall. Potato's real weekly
-            # formula (functions.py, weekly_dose_patient_scatter) has NO F/400
-            # term - that normalisation only appeared in potato's separate
-            # dose-rate calc, never here. Confirmed:
-            # including it here overstated H_PS by exactly 4x (F/400=4)
-            # against the verified reference.
+            # Eq 3.7 (NCRP 151 Eq 2.11): patient scatter off the maze wall.
+            # F/400 normalises the field to the 400 cm2 of Table B.4. alpha1 is
+            # the 0.5 MeV value. Checked against the Theagenio INFINITY sheet.
             H_PS = (
-                alpha_theta * (W_max * alpha1_max + W_min * alpha1_min)
-                * U_G * A1
+                (W_max * alpha_theta_max + W_min * alpha_theta_min) * (F / 400.0)
+                * alpha1_ps * U_G * A1
             ) / ((d_sca * d_sec * d_zz) ** 2)
 
             # Eq 3.8: leakage straight through the inner maze wall.
@@ -1887,9 +1812,9 @@ class Step_M_Calculations(WizardStep):
                 goal_note = "full P (photons are the only component below 10 MV)"
 
             self._results = {
-                "B_LT": B_LT, "alpha_theta": alpha_theta, "alpha_z": alpha_z,
+                "B_LT": B_LT, "alpha_theta_max": alpha_theta_max, "alpha_theta_min": alpha_theta_min, "alpha_z": alpha_z,
                 "alpha0_max": alpha0_max, "alpha0_min": alpha0_min,
-                "alpha1_max": alpha1_max, "alpha1_min": alpha1_min,
+                "alpha1_max": alpha1_max, "alpha1_min": alpha1_min, "alpha1_ps": alpha1_ps,
                 "H_s": H_s, "H_LS": H_LS, "H_PS": H_PS, "H_LT": H_LT,
                 "H0": H0, "H_ph": H_ph, "B_ph": B_ph,
             }
@@ -1941,8 +1866,12 @@ class Step_M_Calculations(WizardStep):
 # ------------------------------------------------------------------------------
 # B_ph already computed in Step_M_Calculations. This step converts it to a
 # lead thickness.
-# TVL for photon scatter/leakage in lead is 0.6 cm throughout.
+# TVL for photon scatter/leakage in lead depends on the door photon energy chosen
+# in M geometry: 0.6 cm at 0.2 MeV (NCRP 151), 2.0 cm at 1 MeV (hospital sheet).
 # ==============================================================================
+
+_DOOR_LEAD_TVL = {"0.2 MeV": 0.6, "1 MeV": 2.0}  # cm Pb
+
 
 class Step_M_Bph(WizardStep):
     """Lead thickness from B_ph."""
@@ -1979,10 +1908,10 @@ class Step_M_Bph(WizardStep):
     def _execute(self) -> None:
         d = self.wizard.data
         self._results = {}
-        tvl_ph = 0.6
 
         try:
             B_ph = d["B_ph"]
+            tvl_ph = _DOOR_LEAD_TVL[d["door_energy"]]
 
             # Required lead thickness. B_ph > 1 means the unshielded dose
             # already meets the design goal, so no lead is needed.
@@ -1992,64 +1921,24 @@ class Step_M_Bph(WizardStep):
             else:
                 x_ph_lead = 0.0
 
-            # [IDR] # Instantaneous dose rate through x_ph_lead, using Ddot0 rather
-            # [IDR] # than weekly workload.
-            # [IDR] d_h, d_r, d_z = d["d_h"], d["d_r"], d["d_z"]
-            # [IDR] d_sca, d_sec, d_zz, d_L = d["d_sca"], d["d_sec"], d["d_zz"], d["d_L"]
 
-            # [IDR] if min(d_h, d_r, d_z, d_sca, d_sec, d_zz, d_L) <= 0.0:
-                # [IDR] raise ValueError("All distance parameters must be > 0.")
 
-            # [IDR] # Structurally mirrors H_s: pure double-reflection geometry with
-            # [IDR] # Ddot0 in place of W. The old B_pr transmission term was a
-            # [IDR] # site-specific artefact, not NCRP - removed.
-            # [IDR] # No independently verified numeric target exists for this form yet.
-            # [IDR] DRs = (
-                # [IDR] (d["Ddot0_max"] * d["alpha0_max"] + d["Ddot0_min"] * d["alpha0_min"])
-                # [IDR] * d["U_G"] * d["A0"] * d["alpha_z"] * d["Az"]
-            # [IDR] ) / ((d_h * d_r * d_z) ** 2)
 
-            # [IDR] # Matches the reverted H_PS: energy-split alpha1, not the soft
-            # [IDR] # spectrum substitution. Potato's real formula, verified.
-            # [IDR] DR_ps = (
-                # [IDR] (d["Ddot0_max"] * d["alpha1_max"] + d["Ddot0_min"] * d["alpha1_min"])
-                # [IDR] * d["alpha_theta"] * d["A1"] * (d["F"] / 400.0)
-            # [IDR] ) / ((d_sca * d_sec * d_zz) ** 2)
 
-            # [IDR] DR_ls = (
-                # [IDR] (d["Ddot0_max"] * d["alpha1_max"] + d["Ddot0_min"] * d["alpha1_min"])
-                # [IDR] * d["L_f"] * d["A1"]
-            # [IDR] ) / ((d_sec * d_zz) ** 2)
 
-            # [IDR] DR_lt = (
-                # [IDR] (d["Ddot0_max"] + d["Ddot0_min"]) * d["B_LT"] * d["L_f"]
-            # [IDR] ) / (d_L ** 2)
 
-            # [IDR] DR_ph = DR_ps + d["f"] * DRs + DR_ls + DR_lt
-            # [IDR] IDR_ph = DR_ph * (10.0 ** (-x_ph_lead / tvl_ph))
 
             self._results = {
                 "x_ph_lead": x_ph_lead,
-                # [IDR] "DRs": DRs, "DR_ps": DR_ps, "DR_ls": DR_ls, "DR_lt": DR_lt,
-                # [IDR] "DR_ph": DR_ph, "IDR_ph": IDR_ph,
             }
 
             report = [
                 "=" * 65,
-                # [IDR] "REQUIRED LEAD THICKNESS AND DOSE RATE CHECK",
                 "REQUIRED LEAD THICKNESS",
                 "=" * 65,
                 f"B_ph (required transmission)   : {B_ph:.3e}",
+                f"Door photon energy / lead TVL  : {d['door_energy']} / {tvl_ph:.1f} cm",
                 f"Lead thickness x_ph_lead       : {x_ph_lead:.2f} cm",
-                # [IDR] "-" * 65,
-                # [IDR] "Instantaneous dose rate through x_ph_lead:",
-                # [IDR] f"  Wall scatter          DRs   : {DRs:.3e} Sv/h",
-                # [IDR] f"  Patient scatter        DR_ps : {DR_ps:.3e} Sv/h",
-                # [IDR] f"  Head leakage scatter   DR_ls : {DR_ls:.3e} Sv/h",
-                # [IDR] f"  Leakage transmission   DR_lt : {DR_lt:.3e} Sv/h",
-                # [IDR] "-" * 65,
-                # [IDR] f"Total dose rate         DR_ph : {DR_ph:.3e} Sv/h",
-                # [IDR] f"Instantaneous dose rate IDR_ph: {IDR_ph:.3e} Sv/h",
                 "=" * 65,
             ]
             self.text_area.delete("1.0", "end")
@@ -2077,8 +1966,6 @@ class Step_M_Bph(WizardStep):
 class Step_M_Results(WizardStep):
     """Final photon-only result: required lead at the door."""
 
-    # Lead TVL for the scatter/leakage photon spectrum at the door.
-    _TVL_PB = 0.6
     # log10(2) - one HVL expressed as a fraction of a TVL.
     _HVL_FRACTION = 0.301
 
@@ -2116,8 +2003,7 @@ class Step_M_Results(WizardStep):
         d = self.wizard.data
         try:
             x_pb = d["x_ph_lead"]
-            # [IDR] idr = d["IDR_ph"]
-            margin = self._HVL_FRACTION * self._TVL_PB
+            margin = self._HVL_FRACTION * _DOOR_LEAD_TVL[d["door_energy"]]
             x_total = x_pb + margin
 
             report = [
@@ -2130,9 +2016,6 @@ class Step_M_Results(WizardStep):
                 f"Calculated lead thickness      : {x_pb:.2f} cm Pb",
                 f"Plus 1 HVL safety margin       : {margin:.2f} cm Pb",
                 f"Recommended total              : {x_total:.2f} cm Pb",
-                # [IDR] "-" * 65,
-                # [IDR] f"Instantaneous dose rate IDR_ph : {idr:.3e} Sv/h",
-                # [IDR] f"                               = {idr * 1e6:.2f} uSv/h",
             ]
 
 
@@ -2328,12 +2211,6 @@ class Step_N_Params(WizardStep):
             x_n_concrete = N_n * 15.0
         d["x_n_PBE"], d["x_n_concrete"] = x_n_PBE, x_n_concrete
 
-        # [IDR] if E_min >= 10.0:
-            # [IDR] DR_n = (w["Ddot0_max"] + w["Ddot0_min"]) * H_n_D
-        # [IDR] else:
-            # [IDR] DR_n = w["Ddot0_max"] * H_n_D
-        # [IDR] IDR_n = DR_n * 10.0 ** (-x_n_PBE / 4.5)
-        # [IDR] d["DR_n"], d["IDR_n"] = DR_n, IDR_n
 
         # Capture gamma only above 10 MV. At exactly 10 MV, photoneutron
         # production is not yet significant enough to pose a capture-gamma
@@ -2368,12 +2245,6 @@ class Step_N_Params(WizardStep):
             d["x_cg_concrete"] = x_cg_concrete
             d["x_cg_steel"] = x_cg_steel
 
-            # [IDR] if E_min >= 10.0:
-                # [IDR] DR_cg = (w["Ddot0_max"] + w["Ddot0_min"]) * h_phi
-            # [IDR] else:
-                # [IDR] DR_cg = w["Ddot0_max"] * h_phi
-            # [IDR] IDR_cg = DR_cg * 10.0 ** (-x_cg_lead / 6.1)
-            # [IDR] d["DR_cg"], d["IDR_cg"] = DR_cg, IDR_cg
 
         self._results = d
         return d
@@ -2425,16 +2296,14 @@ class Step_N_Results(WizardStep):
         d = self.wizard.data
         try:
             x_ph = d["x_ph_lead"]
-            # [IDR] idr_ph = d["IDR_ph"]
 
             x_n_pbe = d["x_n_PBE"]
             x_n_conc = d["x_n_concrete"]
-            # [IDR] idr_n = d["IDR_n"]
 
             cg_skipped = d.get("cg_skipped", False)
 
             m = self._HVL_FRACTION
-            ph_margin = m * 0.6
+            ph_margin = m * _DOOR_LEAD_TVL[d["door_energy"]]
             n_pbe_margin = m * 4.5
             n_conc_margin = m * 15.0
 
@@ -2449,7 +2318,6 @@ class Step_N_Results(WizardStep):
                 f"  Calculated                : {x_ph:.2f} cm Pb",
                 f"  Plus 1 HVL margin         : {ph_margin:.2f} cm Pb",
                 f"  Recommended total         : {x_ph + ph_margin:.2f} cm Pb",
-                # [IDR] f"  IDR                       : {idr_ph:.3e} Sv/h ({idr_ph*1e6:.2f} uSv/h)",
                 "-" * 65,
                 "NEUTRONS",
                 f"  Calculated (PBE)          : {x_n_pbe:.2f} cm PBE",
@@ -2457,7 +2325,6 @@ class Step_N_Results(WizardStep):
                 f"  Recommended total         : {x_n_pbe + n_pbe_margin:.2f} cm PBE",
                 f"  Equivalent (concrete)     : {x_n_conc:.2f} cm, "
                 f"+{n_conc_margin:.2f} HVL = {x_n_conc + n_conc_margin:.2f} cm",
-                # [IDR] f"  IDR                       : {idr_n:.3e} Sv/h ({idr_n*1e6:.2f} uSv/h)",
                 "-" * 65,
                 "CAPTURE GAMMA",
             ]
@@ -2469,14 +2336,10 @@ class Step_N_Results(WizardStep):
                     "  enough to pose a capture-gamma radiological hazard",
                     "  (Deye and Young, 1977).",
                 ]
-                # [IDR] idr_cg = 0.0
-                # [IDR] dr_cg = 0.0
             else:
                 x_cg_pb = d["x_cg_lead"]
                 x_cg_conc = d["x_cg_concrete"]
                 x_cg_steel = d["x_cg_steel"]
-                # [IDR] idr_cg = d["IDR_cg"]
-                # [IDR] dr_cg = d["DR_cg"]
                 cg_pb_margin = m * 6.1
                 cg_conc_margin = m * 33.0
                 cg_steel_margin = m * 10.0
@@ -2487,7 +2350,6 @@ class Step_N_Results(WizardStep):
                     f"+{cg_conc_margin:.2f} HVL = {x_cg_conc + cg_conc_margin:.2f} cm",
                     f"  Steel                     : {x_cg_steel:.2f} cm, "
                     f"+{cg_steel_margin:.2f} HVL = {x_cg_steel + cg_steel_margin:.2f} cm",
-                    # [IDR] f"  IDR                       : {idr_cg:.3e} Sv/h ({idr_cg*1e6:.2f} uSv/h)",
                 ]
             
 
@@ -2687,11 +2549,9 @@ class Step_D_Geometry(WizardStep):
 # two-source rule (Sec 2.3), not simply added as doses.
 # Photons are the only component here, so the full design goal P applies.
 #
-# TVLs come from NCRP Table B.5 (leakage and scattered photons, concrete),
-# not the primary-beam table: leaked and scattered photons are softer and
-# attenuate faster. Scatter gets a single angle-dependent TVL; leakage keeps
-# the TVL1/TVLe split. Digitised at 6 and 18 MV only - 10 MV raises a clear
-# ValueError rather than borrowing a neighbour's numbers.
+# TVLs: scatter from NCRP Table B.5a (angle-dependent), leakage from Table B.7
+# with the TVL1/TVLe split. Not the primary-beam table: leaked and scattered
+# photons are softer and attenuate faster.
 # ==============================================================================
 
 class Step_D_Calculations(WizardStep):
@@ -2734,6 +2594,7 @@ class Step_D_Calculations(WizardStep):
             P, T, L_f, F = d["P"], d["T"], d["L_f"], d["F"]
             d_sca, d_sec, d_L, theta = d["d_sca"], d["d_sec"], d["d_L"], d["theta"]
             W_min, W_max = d["W_min"], d["W_max"]
+            W_L_min, W_L_max = d["W_L_min"], d["W_L_max"]
             E_max = d["E_max"]
 
             # U = 1 by NCRP 151 Sec 2.2 for secondary barriers. Multiplying
@@ -2741,16 +2602,18 @@ class Step_D_Calculations(WizardStep):
 
             # Scatter fraction from the same Table B.4 lookup the M-branch
             # uses. Same physical quantity, same table, different geometry.
+            # Per energy, as in the M-branch.
             a = lookup_scatter_fraction_b4(theta, E_max)
+            a_min = lookup_scatter_fraction_b4(theta, d["E_min"])
 
             # Eq 2.7 rearranged for H. Both energies' workloads contribute.
             H_ps = (
-                a * (W_max + W_min) * T * (F / 400.0)
+                (W_max * a + W_min * a_min) * T * (F / 400.0)
             ) / ((d_sca ** 2) * (d_sec ** 2))
 
             # Eq 2.8 rearranged for H. L_f is the leakage ratio (NCRP 1e-3),
             # exposed as a field so a vendor-stated value can override it.
-            H_L = (L_f * (W_max + W_min) * T) / (d_L ** 2)
+            H_L = (L_f * (W_L_max + W_L_min) * T) / (d_L ** 2)
 
             # Full P: photons are the only component at a direct door.
             B_ps = P / H_ps if H_ps > 0.0 else float("inf")
@@ -2804,23 +2667,14 @@ class Step_D_Calculations(WizardStep):
                 t_final = max(t_ps, t_L) + hvl_ctrl
                 rule_note = f"Difference < 1 TVL. Added 1 HVL ({hvl_ctrl:.2f} cm) to the larger."
 
-            # [IDR] # Instantaneous dose rate. D0 plays the role W plays above.
-            # [IDR] # Each component decays through its own TVL, not a shared one.
-            # [IDR] D0_max = d["Ddot0_max"]
-            # [IDR] IDR_ps_unshielded = (D0_max * a * (F / 400.0)) / ((d_sca ** 2) * (d_sec ** 2))
-            # [IDR] IDR_L_unshielded = (D0_max * L_f) / (d_L ** 2)
 
-            # [IDR] IDR_ps = IDR_ps_unshielded * transmission_scatter(t_final)
-            # [IDR] IDR_L = IDR_L_unshielded * transmission_leakage(t_final)
-            # [IDR] IDR_total = IDR_ps + IDR_L
 
             self._results = {
-                "a_scatter": a, "H_ps": H_ps, "H_L": H_L,
+                "a_scatter": a, "a_scatter_min": a_min, "H_ps": H_ps, "H_L": H_L,
                 "B_ps": B_ps, "B_L": B_L,
                 "n_ps": n_ps, "n_L": n_L, "t_ps": t_ps, "t_L": t_L,
                 "t_final": t_final,
                 "TVL_s": TVL_s, "TVL_L1": TVL_L1, "TVL_Le": TVL_Le,
-                # [IDR] "IDR_ps": IDR_ps, "IDR_L": IDR_L, "IDR_total": IDR_total,
             }
 
             report = [
@@ -2828,7 +2682,7 @@ class Step_D_Calculations(WizardStep):
                 "NCRP 151 DIRECT DOOR RESULTS (SEC 2.2, U = 1)",
                 "=" * 65,
                 f"Scatter fraction a(theta={theta} deg, E_max={E_max} MV): {a:.3e}",
-                f"TVLs (Table B.5, concrete): scatter {TVL_s:.1f} cm, "
+                f"TVLs (B.5a scatter, B.7 leakage, concrete): scatter {TVL_s:.1f} cm, "
                 f"leakage {TVL_L1:.1f}/{TVL_Le:.1f} cm",
                 "-" * 65,
                 f"H_ps (patient scatter, unshielded) : {H_ps:.3e} Sv/wk",
@@ -2840,11 +2694,6 @@ class Step_D_Calculations(WizardStep):
                 "Two-source rule (NCRP 151 Sec 2.3):",
                 f"  {rule_note}",
                 f"  Combined barrier thickness      : {t_final:.2f} cm",
-                # [IDR] "-" * 65,
-                # [IDR] "IDR through combined barrier (per-component TVLs):",
-                # [IDR] f"  Scatter   : {IDR_ps:.3e} Sv/h",
-                # [IDR] f"  Leakage   : {IDR_L:.3e} Sv/h",
-                # [IDR] f"  Total     : {IDR_total:.3e} Sv/h ({IDR_total*1e6:.2f} uSv/h)",
                 "=" * 65,
             ]
             self.text_area.delete("1.0", "end")
@@ -2915,13 +2764,10 @@ class Step_D_Results(WizardStep):
                 f"Combined barrier thickness : {d['t_final']:.2f} cm "
                 f"(TVL_s={d['TVL_s']:.1f}, TVL_L1={d['TVL_L1']:.1f}, "
                 f"TVL_Le={d['TVL_Le']:.1f})",
-                # [IDR] "-" * 65,
-                # [IDR] f"IDR at the door            : {d['IDR_total']:.3e} Sv/h "
-                # [IDR] f"({d['IDR_total']*1e6:.2f} uSv/h)",
                 "=" * 65,
                 "",
-                "TVLs are NCRP 151 Table B.5 (leakage and scattered photons,",
-                "concrete), digitised at 6 and 18 MV only. 10 MV is a known gap.",
+                "TVLs are NCRP 151 Table B.5a (scattered photons, by angle) and",
+                "Table B.7 (leakage), concrete.",
                 "",
                 "Verify against your own calculation before signing anything.",
             ]

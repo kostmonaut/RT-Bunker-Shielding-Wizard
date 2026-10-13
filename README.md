@@ -19,6 +19,9 @@ Originally developed as the practical implementation of the master's research th
 
 **Requires Python 3.9 or newer.** The program is written in standard Python and utilizes built-in libraries (`tkinter`, `math`). No external dependencies are strictly required to run the source code.
 
+### Windows Executable
+A standalone `RT-Bunker-Shielding-Wizard.exe` (no Python needed) is built automatically by GitHub Actions. Download it from the latest release on the Releases page, or from the artifacts of the latest "Build Windows executable" run under the Actions tab.
+
 ### Running from Source
 Execute the script directly from your terminal:
 ```bash
