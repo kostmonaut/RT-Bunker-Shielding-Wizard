@@ -19,11 +19,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Test the wizard on Windows (hospital reference values)
+        run: python tests/gui_smoke.py
+
       - name: Install PyInstaller
         run: python -m pip install --upgrade pip pyinstaller==6.11.1
 
       - name: Build exe
         run: pyinstaller --onefile --windowed --name RT-Bunker-Shielding-Wizard shielding_wizard.py
+
+      - name: Smoke-test the exe (must start and stay open)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\RT-Bunker-Shielding-Wizard.exe -PassThru
+          Start-Sleep -Seconds 15
+          if ($p.HasExited) { Write-Error "exe exited early with code $($p.ExitCode)"; exit 1 }
+          Write-Host "exe is running (pid $($p.Id)), window title: '$($p.MainWindowTitle)'"
+          Stop-Process -Id $p.Id -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
